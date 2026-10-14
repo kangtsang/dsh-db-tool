@@ -165,6 +165,10 @@ export async function createTransferReader(rc: ResolvedConnection, loc?: Transfe
     const { createMongoTransferReaderFromConn } = await import('./kinds/mongo.js');
     return createMongoTransferReaderFromConn(rc, loc);
   }
+  if (kind === 'sqlserver') {
+    const { createSqlserverTransferReaderFromConn } = await import('./kinds/sqlserver.js');
+    return createSqlserverTransferReaderFromConn(rc, loc);
+  }
   throw new Error(`数据传输暂不支持读取 ${kind}（待后续版本支持）`);
 }
 
@@ -206,6 +210,10 @@ export async function createTransferWriter(
   if (kind === 'mongodb') {
     const { createMongoTransferWriterFromConn } = await import('./kinds/mongo.js');
     return createMongoTransferWriterFromConn(rc, writeMode, loc);
+  }
+  if (kind === 'sqlserver') {
+    const { createSqlserverTransferWriterFromConn } = await import('./kinds/sqlserver.js');
+    return createSqlserverTransferWriterFromConn(rc, writeMode, loc);
   }
   throw new Error(`数据传输暂不支持写入 ${kind}（待后续版本支持）`);
 }

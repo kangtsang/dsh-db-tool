@@ -30,6 +30,7 @@ function stubFetch(url: string, init?: any) {
 	const body = init && init.body ? JSON.parse(init.body) : {};
 	fetchCalls.push({ url, body });
 	const data = fetchHandler(url, body);
+	if (data === undefined) return new Promise(() => {}); // 永挂：驱动「加载中」态（仅显式返回 undefined 的用例触发）
 	return Promise.resolve({ ok: true, text: () => Promise.resolve(JSON.stringify({ ok: true, data })) });
 }
 const tick = () => new Promise((r) => setImmediate(r));
@@ -210,12 +211,12 @@ interface Harness {
 	unmount(): void;
 }
 
-function makeHarness(mode: 'ro' | 'rw'): Harness {
+function makeHarness(mode: 'ro' | 'rw', conns?: any[]): Harness {
 	const host = reactStub;
 	host.reset(); // 清 hooks 槽位与 effect 队列，防测试间串扰
 	const errors: string[] = [];
 	const props = {
-		conns: [{ id: 'c1', kind: 'mysql', name: '本地MySQL' }],
+		conns: conns || [{ id: 'c1', kind: 'mysql', name: '本地MySQL' }],
 		grants: [{ connId: 'c1', mode }],
 		projectPath: 'E:/proj',
 		busy: '',
@@ -241,9 +242,9 @@ function makeHarness(mode: 'ro' | 'rw'): Harness {
 }
 // 选连接并让状态生效：settle 放行 vendor bundle 异步加载，再 step 挂载编辑器
 // （真实浏览器中编辑器就绪前点执行：textarea 分支文本为空则不执行——同实现的空文本守卫）
-async function pickConn(h: Harness) {
+async function pickConn(h: Harness, id = 'c1') {
 	const sel = collect(h.tree()).find((n) => n.type === 'select');
-	sel!.props.onChange({ target: { value: 'c1' } });
+	sel!.props.onChange({ target: { value: id } });
 	h.step();
 	await h.settle();
 	h.step();
@@ -284,6 +285,12 @@ describe('classifyHead 预分类', () => {
 		expect(T.classifyHead('mongodb', '{"find":"users"}')).toBe('query');
 		expect(T.classifyHead('mongodb', '{"count":"users"}')).toBe('query');
 		expect(T.classifyHead('mongodb', '{"insertOne":"users"}')).toBe('execute');
+	});
+	it('sqlserver：与 SQL 系同走读首词清单', () => {
+		expect(T.classifyHead('sqlserver', 'SELECT TOP 1 * FROM t')).toBe('query');
+		expect(T.classifyHead('sqlserver', '  with x as (select 1) select * from x')).toBe('query');
+		expect(T.classifyHead('sqlserver', 'EXEC dbo.p')).toBe('execute');
+		expect(T.classifyHead('sqlserver', 'INSERT INTO t VALUES (1)')).toBe('execute');
 	});
 });
 
@@ -434,5 +441,89 @@ describe('多标签与历史', () => {
 		expect(histBtn).toBeTruthy();
 		histBtn!.props.onClick();
 		expect(ed.lastDoc).toContain('SELECT 1; DELETE FROM t');
+	});
+});
+
+/* ---------- 跨库下拉可见性：失败可见可重试 / 换连接不残留 / 加载中占位 / 单库门槛 ---------- */
+
+describe('跨库下拉可见性', () => {
+	it('列库失败：错误行可见含原因与重试按钮；恢复正常后点重试，错误行消失且下拉出现', async () => {
+		const h = makeHarness('rw');
+		const prev = fetchHandler;
+		fetchHandler = (url, body) => {
+			if (url.includes('/api/databases')) throw new Error('ECONNREFUSED 127.0.0.1:3326');
+			return prev(url, body);
+		};
+		try {
+			await pickConn(h);
+			expect(flatText(h.tree())).toContain('库清单加载失败');
+			expect(flatText(h.tree())).toContain('ECONNREFUSED 127.0.0.1:3326');
+			const retry = buttonByText(h.tree(), '重试');
+			expect(retry).toBeTruthy();
+			fetchHandler = prev;
+			retry!.props.onClick();
+			await h.settle();
+			h.step();
+			expect(flatText(h.tree())).not.toContain('库清单加载失败');
+			expect(collect(h.tree()).filter((n) => n.type === 'select')).toHaveLength(2); // 连接下拉 + 跨库下拉
+		} finally {
+			fetchHandler = prev;
+		}
+	});
+
+	it('换连接：旧连接列库失败后切新连接，错误行不残留', async () => {
+		const conns = [
+			{ id: 'c1', kind: 'mysql', name: 'A' },
+			{ id: 'c2', kind: 'postgresql', name: 'B' },
+		];
+		const h = makeHarness('rw', conns);
+		const prev = fetchHandler;
+		fetchHandler = (url, body) => {
+			if (url.includes('/api/databases') && url.includes('connId=c1')) throw new Error('boom');
+			return prev(url, body);
+		};
+		try {
+			await pickConn(h, 'c1');
+			expect(flatText(h.tree())).toContain('库清单加载失败');
+			await pickConn(h, 'c2');
+			expect(flatText(h.tree())).not.toContain('库清单加载失败');
+			expect(collect(h.tree()).filter((n) => n.type === 'select')).toHaveLength(2);
+		} finally {
+			fetchHandler = prev;
+		}
+	});
+
+	it('加载中：请求挂起时显示 … 占位且无下拉（不再静默消失）', async () => {
+		const h = makeHarness('rw');
+		const prev = fetchHandler;
+		fetchHandler = (url, body) => (url.includes('/api/databases') ? undefined : prev(url, body));
+		try {
+			const sel = collect(h.tree()).find((n) => n.type === 'select');
+			sel!.props.onChange({ target: { value: 'c1' } });
+			h.step(); // flush effect：setDbsLoading(true) + api 挂起
+			h.step(); // 重渲染：加载中可见
+			const placeholder = collect(h.tree()).find(
+				(n) => n.type === 'span' && String(n.props.className || '').includes('dbt-muted') && flatText(n) === '…',
+			);
+			expect(placeholder).toBeTruthy();
+			expect(collect(h.tree()).filter((n) => n.type === 'select')).toHaveLength(1); // 无跨库下拉
+		} finally {
+			fetchHandler = prev;
+		}
+	});
+
+	it('单库清单不渲染下拉；多库清单渲染（门槛 >1）', async () => {
+		const h1 = makeHarness('rw');
+		const prev = fetchHandler;
+		fetchHandler = (url, body) => (url.includes('/api/databases') ? ['db1'] : prev(url, body));
+		try {
+			await pickConn(h1);
+			expect(collect(h1.tree()).filter((n) => n.type === 'select')).toHaveLength(1); // 仅连接下拉
+		} finally {
+			fetchHandler = prev;
+		}
+		const h2 = makeHarness('rw');
+		await pickConn(h2); // 默认 handler：['db1','db2']
+		expect(collect(h2.tree()).filter((n) => n.type === 'select')).toHaveLength(2);
 	});
 });

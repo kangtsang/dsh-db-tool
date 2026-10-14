@@ -37,6 +37,71 @@ const SQL_HIDDEN_DANGER_RE = /[;]\s*\S|into\s+(outfile|dumpfile)|load_file\s*\(|
 /** 读语句体内出现写关键字即 danger（WITH...DELETE / EXPLAIN ANALYZE DELETE 等） */
 const SQL_WRITE_BODY_RE = /\b(insert|update|delete|merge|drop|alter|truncate)\b/i;
 
+/** SQL Server（T-SQL）专属高危首词。**仅 kind = 'sqlserver' 时启用**——通用 DDL/DML/MAINT
+ *  正则一律不动（既有 8 库判定口径保持不变）。
+ *  T-SQL 把这些语句的首词写成通用正则之外（backup/restore/dbcc/reconfigure/bulk），若不追加
+ *  会在 execute 通道静默降级为 warning，确认门槛失效：
+ *   - BACKUP / RESTORE：整库/日志备份与还原（可覆盖生产数据）
+ *   - DBCC：修复/收缩/重建，部分选项会破坏数据页
+ *   - RECONFIGURE / sp_configure：改实例级选项（含启用 xp_cmdshell、CLR、OLE 自动化）
+ *   - BULK INSERT：从服务器可访问路径直接加载数据（绕应用层校验）
+ *   - xp_cmdshell：扩展存储过程，可执行任意 OS 命令
+ *  SHUTDOWN 已在通用 SQL_MAINT_RE 命中，此处列出只为给出 T-SQL 专属原因文案。 */
+export const SQLSERVER_DANGER_HEADS: ReadonlySet<string> = new Set([
+  'backup', 'restore', 'dbcc', 'reconfigure', 'bulk', 'shutdown', 'sp_configure', 'xp_cmdshell',
+]);
+
+/** T-SQL 语句体内出现即 danger 的形态：EXEC/EXECUTE 后接扩展存储过程 xp_*、sp_configure
+ *  或 sp_executesql（动态 SQL 入口）。覆盖 `EXEC xp_cmdshell`、`EXEC master..xp_cmdshell`、
+ *  `EXEC @rc = master.dbo.xp_cmdshell`、`EXEC sp_configure 'show advanced options', 1`、
+ *  `EXEC sp_executesql N'DROP TABLE t'`，以及远端字符串形态 `OPENQUERY(ls,'EXEC xp_...')`。
+ *  中间限长 200 字符，防跨语句误命中。
+ *  **用「仅剥注释」的 body 判定，不用剥字面量的结构文本**：动态执行的证据就在字面量里，
+ *  剥掉就看不见了。代价是 `SELECT 'EXEC xp_cmdshell' AS s` 这类把该词写进字符串的读语句
+ *  也会要求确认（fail-closed，宁可多确认一次）。 */
+const SQLSERVER_DANGER_BODY_RE = /\bexec(?:ute)?\b[\s\S]{0,200}?\b(?:xp_\w+|sp_configure|sp_executesql)\b/i;
+
+/** T-SQL 动态 SQL 执行形态本身即 danger：EXEC/EXECUTE 后跟括号起始的字符串（`EXEC('…')`）、
+ *  字符串字面量（`EXEC N'…'` / `EXEC '…'`）或变量（`EXEC @sql` / `EXEC(@sql)`）——被执行的
+ *  文本在确认时不可知，静态清单无法判定其内容，故一律确认。
+ *  对照（不误报）：`EXEC sp_who`、`EXEC dbo.usp_x`（静态对象名，走通用未识别 warning）。
+ *  同样用「仅剥注释」的 body 判定（需要看到括号与引号本身）。 */
+const SQLSERVER_DYNAMIC_EXEC_RE = /\bexec(?:ute)?\s*(?:\(\s*)?(?:n\s*)?(?:'|@\w+)/i;
+
+/** T-SQL 的 `SELECT ... INTO <表|#临时表>` 会创建对象（建表副作用），但通用
+ *  SQL_HIDDEN_DANGER_RE 的 into 只认 MySQL 的 OUTFILE/DUMPFILE，不覆盖该形态。
+ *  - 要求 select 在 into 之前（不误伤 INSERT INTO / MERGE ... USING）；
+ *  - `(?<!\bas\s)`：`SELECT 1 AS into FROM t` 的 into 是列别名，不是建表目标；
+ *  - `(?!@)`：`INTO @t` 是表变量/变量赋值，不产生永久对象，放行（若日后要连表变量一起挡，
+ *    去掉该段即可，代价是 `SELECT 1 INTO @t` 这类常见写法每次都要确认）。
+ *  残留误报：`SELECT a FROM t ORDER BY into`（into 作未引用列名）会要求确认——fail-closed，
+ *  正常写法列名会加 [ ] 而结构文本已剥掉方括号标识符。 */
+const SQLSERVER_SELECT_INTO_RE = /(?<!\bas\s)\binto\s+(?!@)/i;
+
+/** 剥掉字符串字面量与带引号标识符，只留 SQL 结构：单引号串（'' 转义，含 N 前缀）、
+ *  双引号标识符、方括号标识符（]] 转义）统一替换为空白。供 sqlserver 专属词法判定使用，
+ *  使 `SELECT 'into tbl'` / `SELECT [into] FROM t` 不被 INTO 规则误伤。 */
+function stripSqlLiterals(statement: string): string {
+  let out = '';
+  for (let i = 0; i < statement.length; i++) {
+    const ch = statement[i]!;
+    if (ch === "'" || ch === '"' || ch === '[') {
+      const close = ch === '[' ? ']' : ch;
+      let j = i + 1;
+      for (; j < statement.length; j++) {
+        if (statement[j] !== close) continue;
+        if (statement[j + 1] === close) { j++; continue; } // '' / "" / ]] 转义
+        break;
+      }
+      i = j; // 跳到闭合符（for 再 ++ 到其后）
+      out += ' ';
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
 /** MongoDB 读操作白名单（复用 mongodb 适配器导出的 READ_OPS，单一事实来源） */
 const MONGO_READ_OPS: ReadonlySet<string> = READ_OPS;
 
@@ -82,18 +147,49 @@ export function statementHash(statement: string): string {
 export function classifyStatement(kind: DbKind, statement: string, op: 'query' | 'execute'): GuardVerdict {
   if (kind === 'redis') return classifyRedis(statement, op);
   if (kind === 'mongodb') return classifyMongo(statement, op);
-  return classifySql(statement, op);
+  return classifySql(kind, statement, op);
 }
 
-/* ---------------- SQL 系（mysql/postgresql/gaussdb/sqlite/oracle/dmdb） ---------------- */
+/* ---------------- SQL 系（mysql/postgresql/gaussdb/sqlite/oracle/dmdb/sqlserver） ---------------- */
 
-function classifySql(statement: string, op: 'query' | 'execute'): GuardVerdict {
+function classifySql(kind: DbKind, statement: string, op: 'query' | 'execute'): GuardVerdict {
   const head = sqlHead(statement);
   if (head === '') return { level: 'danger', reason: '无法解析语句关键字，按危险语句处理' };
 
   // 语句体分析一律基于剥注释后的文本：写词藏在注释里不应触发分级（误报），
   // 前导注释也不能使 DDL/DML 锚定失效（漏报——否则 /* x */ DROP 绕过确认）
   const body = stripSqlComments(statement);
+
+  // T-SQL 专属高危（BACKUP/RESTORE/DBCC/RECONFIGURE/sp_configure/xp_*/动态 SQL）先判：
+  // 这些形态不落在通用 DDL/DML/MAINT 正则上，不先判会降级为 warning（详见各常量注释）。
+  // 只对 sqlserver 生效，通用正则与其它 kind 的判定口径不受影响。
+  if (kind === 'sqlserver') {
+    // 1) 首词危险清单 与 动态执行证据（EXEC … xp_*/sp_configure/sp_executesql、EXEC('…')、
+    //    EXEC @sql）都用「仅剥注释」的 body 判：动态执行的证据在字面量里，剥掉就看不见了。
+    if (SQLSERVER_DANGER_HEADS.has(head)
+      || SQLSERVER_DANGER_BODY_RE.test(body)
+      || SQLSERVER_DYNAMIC_EXEC_RE.test(body)) {
+      return { level: 'danger', reason: 'T-SQL 高危语句（备份/还原/DBCC/实例配置/扩展存储过程/动态 SQL），需要确认' };
+    }
+    // 2) 读头（select/with/show/set/…）就地判定并返回，把「写体扫描」换成剥字面量后的结构文本：
+    //    `OPENQUERY(ls,'DELETE FROM t')` 的 delete 在远端字符串里，不是本语句的写操作（不升级）；
+    //    而「多语句/未闭合字面量」仍用原文判——`SELECT 'a''; DROP TABLE t` 的第二条语句正是要拦的。
+    if (SQL_READ_HEADS.has(head)) {
+      if (SQL_HIDDEN_DANGER_RE.test(body)) {
+        return { level: 'danger', reason: '读语句包含危险片段（多语句 / 文件读写 / 全局设置 / 锁读），需要确认' };
+      }
+      const struct = stripSqlLiterals(body);
+      if (SQL_WRITE_BODY_RE.test(struct)) {
+        return { level: 'danger', reason: '读语句体内包含写操作关键字（如 WITH...DELETE / EXPLAIN 写语句），需要确认' };
+      }
+      // 3) SELECT ... INTO <表/临时表>：T-SQL 建表副作用（DDL 级），通用正则不覆盖（详见常量注释）。
+      //    已由上面写体扫描排除 WITH … INSERT INTO … SELECT（那是写操作，理由应指向写操作，不误挂这里）。
+      if ((head === 'select' || head === 'with') && SQLSERVER_SELECT_INTO_RE.test(struct)) {
+        return { level: 'danger', reason: 'T-SQL SELECT ... INTO 会创建目标表（DDL 副作用），需要确认' };
+      }
+      return { level: 'none' };
+    }
+  }
 
   const isRead = SQL_READ_HEADS.has(head);
   if (isRead) {

@@ -101,6 +101,118 @@ describe('classifyStatement: SQL 注释剥离', () => {
   });
 });
 
+describe('classifyStatement: SQL Server（T-SQL 专属危险语句）', () => {
+  it('备份/还原/DBCC/实例配置/扩展存储过程：execute 通道也不降级为 warning', () => {
+    for (const stmt of [
+      "BACKUP DATABASE app TO DISK = 'C:\\bak\\app.bak'",
+      "BACKUP LOG app TO DISK = 'C:\\bak\\app.trn'",
+      "RESTORE DATABASE app FROM DISK = 'C:\\bak\\app.bak'",
+      'DBCC CHECKDB (app)',
+      'DBCC SHRINKDATABASE (app)',
+      'RECONFIGURE',
+      "sp_configure 'xp_cmdshell', 1",
+      "EXEC sp_configure 'show advanced options', 1",
+      "EXEC xp_cmdshell 'dir C:\\'",
+      "EXECUTE master..xp_cmdshell 'whoami'",
+      "EXEC @rc = master.dbo.xp_cmdshell 'whoami'",
+      "xp_cmdshell 'dir'",
+      'SHUTDOWN WITH NOWAIT',
+      "BULK INSERT dbo.t FROM 'C:\\data.csv'",
+    ]) {
+      const v = classifyStatement('sqlserver', stmt, 'execute');
+      expect(v.level, stmt).toBe('danger');
+    }
+  });
+
+  it('只读通道（query）同样 danger', () => {
+    expect(classifyStatement('sqlserver', "BACKUP DATABASE app TO DISK = 'x'", 'query').level).toBe('danger');
+    expect(classifyStatement('sqlserver', 'DBCC CHECKDB', 'query').level).toBe('danger');
+  });
+
+  it('普通语句沿用通用口径：专属表不误伤 SELECT/普通存储过程/一般 EXEC', () => {
+    expect(classifyStatement('sqlserver', 'SELECT * FROM users', 'query').level).toBe('none');
+    expect(classifyStatement('sqlserver', 'SELECT TOP 10 [name] FROM [dbo].[t]', 'query').level).toBe('none');
+    expect(classifyStatement('sqlserver', 'INSERT INTO t (a) VALUES (1)', 'execute').level).toBe('warning');
+    expect(classifyStatement('sqlserver', 'MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE', 'execute').level).toBe('warning');
+    expect(classifyStatement('sqlserver', 'DROP TABLE t', 'execute').level).toBe('danger');
+    // 一般 EXEC dbo.usp_* 不属于扩展过程清单：保持未识别 warning，不因 sqlserver 专属表被判 danger
+    expect(classifyStatement('sqlserver', 'EXEC dbo.usp_get_users', 'execute').level).toBe('warning');
+  });
+
+  it('SELECT ... INTO 建表副作用判 danger（T-SQL 独有，通用正则的 into 只认 OUTFILE/DUMPFILE）', () => {
+    expect(classifyStatement('sqlserver', 'SELECT * INTO dbo.newtbl FROM t', 'execute').level).toBe('danger');
+    expect(classifyStatement('sqlserver', 'SELECT TOP 100 col INTO #tmp FROM t', 'query').level).toBe('danger');
+    expect(classifyStatement('sqlserver', 'WITH x AS (SELECT 1 AS a) SELECT * INTO dbo.newtbl FROM x', 'execute').level).toBe('danger');
+  });
+
+  it('CTE 内写操作判 danger（WITH ... DELETE/UPDATE/INSERT）', () => {
+    expect(classifyStatement('sqlserver', 'WITH x AS (SELECT 1 AS a) DELETE FROM dbo.t', 'execute').level).toBe('danger');
+    expect(classifyStatement('sqlserver', 'WITH x AS (SELECT 1 AS a) UPDATE dbo.t SET a = 1', 'execute').level).toBe('danger');
+    expect(classifyStatement('sqlserver', 'WITH x AS (SELECT 1 AS a) INSERT INTO dbo.t (a) SELECT a FROM x', 'execute').level).toBe('danger');
+  });
+
+  it('字符串/带引号标识符内的 INTO 不误报；INTO @ 变量赋值放行；INSERT INTO 口径不变', () => {
+    expect(classifyStatement('sqlserver', "SELECT 'into tbl' AS a", 'query').level).toBe('none');
+    expect(classifyStatement('sqlserver', 'SELECT [into] FROM t', 'query').level).toBe('none');
+    expect(classifyStatement('sqlserver', 'SELECT "into" FROM t', 'query').level).toBe('none');
+    expect(classifyStatement('sqlserver', "SELECT * FROM t WHERE c = 'INTO x'", 'query').level).toBe('none');
+    expect(classifyStatement('sqlserver', 'SELECT 1 INTO @t', 'query').level).toBe('none');
+    // 剥字面量后不得把 INSERT INTO 误当 SELECT INTO（DML 口径保持 warning）
+    expect(classifyStatement('sqlserver', 'INSERT INTO dbo.t (a) VALUES (1)', 'execute').level).toBe('warning');
+  });
+
+  it('EXEC 动态 SQL（括号/字符串/变量）与 sp_executesql 一律 danger；只读系统过程不误报', () => {
+    for (const s of [
+      "EXEC('DROP TABLE t')",
+      "EXEC ( 'DROP TABLE t' )",
+      "EXEC N'DROP TABLE t'",
+      "EXEC sp_executesql N'DROP TABLE t'",
+      "EXEC('xp_cmdshell ''whoami''')",
+      "EXEC('BACKUP DATABASE db TO DISK=''c:\\x.bak''')",
+      'EXEC @sql',
+      'EXECUTE(@sql)',
+      "SELECT * FROM OPENQUERY(ls,'EXEC xp_cmdshell ''whoami''')",
+    ]) {
+      const v = classifyStatement('sqlserver', s, 'execute');
+      expect(v.level, s).toBe('danger');
+    }
+    // 对照：只读系统过程 / 普通存储过程 / 普通读不因动态 SQL 规则误报（仍是未识别 warning，不是 danger）
+    expect(classifyStatement('sqlserver', 'EXEC sp_who', 'execute').level).toBe('warning');
+    expect(classifyStatement('sqlserver', 'EXEC dbo.usp_get_users', 'execute').level).toBe('warning');
+    expect(classifyStatement('sqlserver', 'SELECT 1', 'query').level).toBe('none');
+  });
+
+  it('SELECT ... INTO 收紧：AS 列别名/变量赋值不误判；真建表仍 danger', () => {
+    expect(classifyStatement('sqlserver', 'SELECT 1 AS into FROM t', 'query').level).toBe('none');
+    expect(classifyStatement('sqlserver', 'SELECT 1 as\ninto FROM t', 'query').level).toBe('none');
+    expect(classifyStatement('sqlserver', 'SELECT a FROM t ORDER BY x', 'query').level).toBe('none');
+    expect(classifyStatement('sqlserver', 'SELECT 1 INTO @t', 'query').level).toBe('none');
+    expect(classifyStatement('sqlserver', 'SELECT * INTO dbo.newtbl FROM t', 'query').level).toBe('danger');
+    expect(classifyStatement('sqlserver', 'SELECT [a]]b] INTO t2 FROM t', 'query').level).toBe('danger');
+  });
+
+  it('WITH + 写操作：理由指向写操作，不误挂 SELECT INTO', () => {
+    const v = classifyStatement('sqlserver', 'WITH c AS (SELECT 1 AS n) INSERT INTO t SELECT * FROM c', 'execute');
+    expect(v.level).toBe('danger');
+    expect(v.reason ?? '').not.toMatch(/SELECT \.\.\. INTO/);
+    expect(v.reason ?? '').toMatch(/写操作/);
+  });
+
+  it('远端字符串内的写关键字不误报，但其中动态 EXEC/xp_ 判危；多语句仍拦', () => {
+    expect(classifyStatement('sqlserver', "SELECT * FROM OPENQUERY(ls,'DELETE FROM t')", 'query').level).toBe('none');
+    expect(classifyStatement('sqlserver', "SELECT 'DROP TABLE t' AS msg", 'query').level).toBe('none');
+    // 多语句/未闭合字面量里的第二条语句沿用原文判定（不被剥字面量吞掉）
+    expect(classifyStatement('sqlserver', "SELECT 'a''; DROP TABLE t", 'query').level).toBe('danger');
+    expect(classifyStatement('sqlserver', "SELECT * FROM OPENQUERY(ls,'EXEC xp_cmdshell ''whoami''')", 'query').level).toBe('danger');
+  });
+
+  it('专属表只对 sqlserver 生效：BACKUP/DBCC 在其它 kind 仍走既有未识别口径', () => {
+    expect(classifyStatement('mysql', "BACKUP DATABASE x TO DISK = 'y'", 'execute').level).toBe('warning');
+    expect(classifyStatement('mysql', 'DBCC CHECKDB', 'execute').level).toBe('warning');
+    expect(classifyStatement('postgresql', 'BACKUP DATABASE x', 'execute').level).toBe('warning');
+  });
+});
+
 describe('classifyStatement: Redis', () => {
   it('危险命令 danger（13 项清单）', () => {
     expect(classifyStatement('redis', 'FLUSHALL', 'execute').level).toBe('danger');

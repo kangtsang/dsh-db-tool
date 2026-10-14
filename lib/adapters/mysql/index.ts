@@ -92,16 +92,46 @@ export async function createMysqlAdapter(
   conn: ResolvedConnection,
   opts?: { mode?: AccessMode },
 ): Promise<DatabaseAdapter & { tx: TxHandle }> {
-  const pool = mysql.createPool(connOptions(conn));
+  const baseOpts = connOptions(conn);
+  const pool = mysql.createPool(baseOpts);
   const readOnly = opts?.mode === 'ro';
-  if (readOnly) {
-    // 服务器级 ro 强制：每个新底层连接自动设为只读会话（应用层另有 query 白名单双保险）。
-    // 回调收到的是 callback 版 PoolConnection，query() 返回 Query 命令对象（EventEmitter）：
-    // 吞掉 SET 失败防 uncaughtException（见 swallowSetError）。
-    pool.on('connection', (c) => {
+
+  // 跨库（Navicat 式）：按库名缓存独立池。mysql2 官方多库方案即多池管理——池上
+  // changeUser/USE 只影响被调用的那条池内连接，池保持建池配置，切库不可靠。
+  const mainDb = typeof baseOpts.database === 'string' ? baseOpts.database : '';
+  const dbPools = new Map<string, mysql.Pool>();
+  /**
+   * 关闭幂等标志（对齐 pg-like/sqlserver）：关闭后一切访问必须被拦下——
+   * 否则跨库访问会新建池（关不掉的连接泄漏），主池请求则报英文驱动错。
+   */
+  let closed = false;
+  const assertOpen = (): void => {
+    if (closed) throw new Error('mysql 连接已关闭：请重新连接后重试');
+  };
+
+  /** ro 模式：每个新底层连接自动设为只读会话（应用层另有 query 白名单双保险）。
+   *  回调收到的是 callback 版 PoolConnection，query() 返回 Query 命令对象（EventEmitter）：
+   *  吞掉 SET 失败防 uncaughtException（见 swallowSetError）。主池与跨库池共用同一注册。 */
+  const attachReadOnly = (p: mysql.Pool): void => {
+    if (!readOnly) return;
+    p.on('connection', (c) => {
       swallowSetError(c.query('SET SESSION TRANSACTION READ ONLY') as unknown);
     });
-  }
+  };
+  attachReadOnly(pool);
+
+  const poolFor = (db: string): mysql.Pool => {
+    assertOpen();
+    if (db === mainDb) return pool;
+    let p = dbPools.get(db);
+    if (!p) {
+      // connOptions 已把 URL/fields 拆成纯字段，覆盖 database 即建出目标库的池
+      p = mysql.createPool({ ...baseOpts, database: db });
+      dbPools.set(db, p);
+      attachReadOnly(p);
+    }
+    return p;
+  };
 
   /** 事务激活期间路由到同一连接，保证 BEGIN/COMMIT 生效 */
   let txConn: PoolConnection | null = null;
@@ -177,22 +207,27 @@ export async function createMysqlAdapter(
         return { ok: true, serverInfo: `MySQL ${String(rows[0]?.v ?? '')}` };
       }),
 
-    query: (sql, params) =>
+    query: (sql, params, database) =>
       humanize('mysql 查询失败', async () => {
         if (readOnly && !RO_READ_PREFIX.test(sql.trimStart())) {
           throw new Error(
             'DRIVER_ERROR: 只读(ro)模式下 query 仅允许读语句（select/show/desc/describe/explain/use/help/table），写操作请使用可写连接',
           );
         }
-        const [rows, fields] = await runner().query(sql, params ?? []);
+        // 跨库请求路由到该库自己的池（白名单校验在前，拒绝发生在建池之前；
+        // 缺省判断用 != null：空串等非法值必须进 assertIdent 被拒，不能落回主池）；
+        // 无 database 时维持事务粘主池语义（服务层已拒绝事务携带 database）
+        const target = database != null ? poolFor(assertIdent(database, '库名')) : runner();
+        const [rows, fields] = await target.query(sql, params ?? []);
         if (!Array.isArray(rows)) return { columns: [], rows: [], rowCount: 0 };
         return toQueryResult(rows as RowDataPacket[], fields);
       }),
 
-    execute: (statement, params) =>
+    execute: (statement, params, database) =>
       humanize('mysql 执行失败', async (): Promise<ExecResult> => {
         // mysql2 的 ExecuteValues 不接受 unknown[]，此处值均为绑定参数（string|number|null）
-        const [result] = await runner().execute(statement, (params ?? []) as never[]);
+        const target = database != null ? poolFor(assertIdent(database, '库名')) : runner();
+        const [result] = await target.execute(statement, (params ?? []) as never[]);
         const header = (Array.isArray(result) ? result[0] : result) as
           | ResultSetHeader
           | undefined;
@@ -273,7 +308,12 @@ export async function createMysqlAdapter(
         return toQueryResult(rows as RowDataPacket[], fields);
       }),
 
-    close: () => humanize('mysql 关闭连接', () => pool.end()),
+    close: () =>
+      humanize('mysql 关闭连接', async () => {
+        if (closed) return; // 幂等：重复 close 为 no-op（pg-pool 二次 end() 会抛的教训）
+        closed = true;
+        await Promise.all([pool.end(), ...[...dbPools.values()].map((p) => p.end())]);
+      }),
   };
 }
 

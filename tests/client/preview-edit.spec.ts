@@ -281,3 +281,42 @@ describe('renderStatementWithParams（危险确认对话框代入展示）', () 
 		expect(T.renderStatementWithParams('a = ?', '{not json')).toBe('a = ?');
 	});
 });
+
+describe('sqlserver（T-SQL）方言与写回', () => {
+	const pk = ['id'];
+	const pkVals = [7];
+
+	it('dialectOf 返回 q：客户端只用 ? 占位符，@pN 由适配器内部重写，客户端不生成 @p1', () => {
+		expect(T.dialectOf('sqlserver')).toBe('q');
+	});
+
+	it('quoteIdent 用方括号，内部 ] 转义为 ]]', () => {
+		expect(T.quoteIdent('sqlserver', 'order')).toBe('[order]');
+		expect(T.quoteIdent('sqlserver', 'a]b')).toBe('[a]]b]');
+		expect(T.quoteIdent('sqlserver', 'weird]')).toBe('[weird]]]');
+	});
+
+	it('buildUpdate：库.schema.表 三段全限定 + ? 占位 + 库名路由', () => {
+		const r = T.buildUpdate('sqlserver', 'users', 'shop.dbo', 'dbo', 'name', '李四', false, pk, pkVals);
+		expect(r.ok).toBe(true);
+		expect(r.ops[0]!.statement).toBe('UPDATE [shop].[dbo].[users] SET [name] = ? WHERE [id] = ?');
+		expect(r.ops[0]!.params).toEqual(['李四', 7]);
+		expect(r.ops[0]!.database).toBe('shop');
+	});
+
+	it('buildUpdate：无 schema 时只写表名（T-SQL 两段式是 schema.object，库由 database 参数路由）', () => {
+		const r = T.buildUpdate('sqlserver', 'users', 'mydb', null, 'name', 'A', false, pk, pkVals);
+		expect(r.ok).toBe(true);
+		expect(r.ops[0]!.statement).toBe('UPDATE [users] SET [name] = ? WHERE [id] = ?');
+		// 回归：绝不可生成 [库].[表]——T-SQL 会把它解析成 schema=mydb，报 208 对象不存在
+		expect(r.ops[0]!.statement).not.toContain('[mydb]');
+		expect(r.ops[0]!.database).toBe('mydb');
+	});
+
+	it('buildUpdate：NULL 写入 params 只含主键；含 ] 的表/列/主键名全部转义', () => {
+		const r = T.buildUpdate('sqlserver', 'a]b', 'shop.dbo', 'dbo', 'c]d', '', true, ['i]d'], [1]);
+		expect(r.ok).toBe(true);
+		expect(r.ops[0]!.statement).toBe('UPDATE [shop].[dbo].[a]]b] SET [c]]d] = NULL WHERE [i]]d] = ?');
+		expect(r.ops[0]!.params).toEqual([1]);
+	});
+});

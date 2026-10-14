@@ -108,16 +108,35 @@ export function mergeUrlCredentials(opts: {
   /** 编辑场景：该连接已存的真实 URL（url 未发/脱敏时的基底回退） */
   secretsUrl?: string;
 }): string | undefined {
-  const { url, urlUser, urlPassword, secretsUrl } = opts;
+  const { urlUser, urlPassword, secretsUrl } = opts;
+  let url = opts.url;
+
+  // 前端编辑 URL 模式连接时回填的是脱敏值（safeUrl，含 :***@）。占位符不是凭据，必须先用
+  // 已存真实凭据替换它再走正常注入——host/port/path/query 保留用户的改动；否则会把字面量
+  // *** 当真密码落盘、连接静默失效（且 safeUrl 显示不变，用户看不出差别）。
+  // 非标准 URL 形态（jdbc: 前缀、多主机逗号端口等）无法可靠合并 → 明确报错要求重输。
+  if (url !== undefined && url.includes(':***@')) {
+    if (secretsUrl === undefined) {
+      throw new Error('URL 中含脱敏占位（***）且无已存真实 URL 可回退，请重新输入完整 URL 或清空用户名/密码框');
+    }
+    try {
+      const sec = new URL(secretsUrl);
+      const edit = new URL(url);
+      if (sec.host === '' || edit.host === '') throw new Error('non-authority');
+      edit.username = sec.username;
+      edit.password = sec.password;
+      url = edit.toString();
+    } catch {
+      throw new Error(
+        '连接 URL 含脱敏占位（***）且无法与已存凭据合并（非标准 URL 形态，如 jdbc: 前缀或多主机串）：请重新输入完整 URL',
+      );
+    }
+  }
+
   if (urlUser === undefined && urlPassword === undefined) return url;
   let base: string;
   if (url === undefined) {
     if (secretsUrl === undefined) return undefined; // 无 URL 可注入，凭据忽略
-    base = secretsUrl;
-  } else if (url.includes(':***@')) {
-    if (secretsUrl === undefined) {
-      throw new Error('URL 中含脱敏占位（***）且无已存真实 URL 可回退，请重新输入完整 URL 或清空用户名/密码框');
-    }
     base = secretsUrl;
   } else {
     base = url;

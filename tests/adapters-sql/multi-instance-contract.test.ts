@@ -1,5 +1,5 @@
 /**
- * 多实例并存 + close 幂等契约（有连接池、且建池惰性的驱动：mysql / postgresql / gaussdb）。
+ * 多实例并存 + close 幂等契约（有连接池、且建池惰性的驱动：mysql / postgresql / gaussdb / sqlserver）。
  *
  * 背景：dmdb 与 oracledb 的驱动都用「进程级池登记表 + 别名」登记池（dmdb 不传别名必抛
  * [20006]；oracledb 不传则退化为匿名池），两者各有专项回归测试。其余驱动经源码审计
@@ -15,6 +15,7 @@ import { describe, expect, it } from 'vitest';
 import { createMysqlAdapter } from '../../lib/adapters/mysql/index.js';
 import { createPostgresqlAdapter } from '../../lib/adapters/postgresql/index.js';
 import { createGaussdbAdapter } from '../../lib/adapters/gaussdb/index.js';
+import { createSqlserverAdapter } from '../../lib/adapters/sqlserver/index.js';
 import type { DatabaseAdapter, DbKind, ResolvedConnection } from '../../lib/adapters/types.js';
 
 type Create = (conn: ResolvedConnection) => Promise<DatabaseAdapter>;
@@ -23,6 +24,9 @@ const CASES: Array<[DbKind, string, Create]> = [
   ['mysql', 'mysql://u:p@127.0.0.1:3326/dbx', createMysqlAdapter],
   ['postgresql', 'postgresql://u:p@127.0.0.1:5432/postgres', createPostgresqlAdapter],
   ['gaussdb', 'gaussdb://u:p@127.0.0.1:8000/postgres', createGaussdbAdapter],
+  // sqlserver：mssql 的 new ConnectionPool(cfg) 只存配置、connect() 才建 TCP（建池惰性，
+  // 离线用例见 sqlserver-offline.test.ts「惰性建连」）；mssql 无进程级池注册表，close 天然幂等
+  ['sqlserver', 'sqlserver://u:p@127.0.0.1:1433/dbx', createSqlserverAdapter],
 ];
 
 describe.each(CASES)('%s 多实例并存契约', (kind, url, create) => {

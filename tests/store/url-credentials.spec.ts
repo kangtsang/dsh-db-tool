@@ -61,6 +61,26 @@ describe('mergeUrlCredentials（纯函数）', () => {
     expect(() => mergeUrlCredentials({ url: 'mysql://root:***@h:3306', urlPassword: 'x' })).toThrow(/脱敏/);
   });
 
+  it('脱敏 url + 用户改了端口/库（密码留空）→ 保留结构性改动，凭据取已存真值，*** 不入库', () => {
+    // 缺陷回归：此前无凭据字段时该函数原样返回含 *** 的串，调用方会把字面量 *** 写进 secrets.url
+    expect(
+      mergeUrlCredentials({
+        url: 'mysql://root:***@h:3307/db2',
+        secretsUrl: 'mysql://root:OLD@h:3306/db',
+      }),
+    ).toBe('mysql://root:OLD@h:3307/db2');
+  });
+
+  it('脱敏 url + 非标准形态（jdbc: 前缀）无法可靠合并 → 明确报错而非静默落 ***', () => {
+    expect(() =>
+      mergeUrlCredentials({
+        url: 'jdbc:mysql://root:***@h:3306/db',
+        urlPassword: 'x',
+        secretsUrl: 'jdbc:mysql://root:OLD@h:3306/db',
+      }),
+    ).toThrow(/无法与已存凭据合并/);
+  });
+
   it('无效 URL → 报错', () => {
     expect(() => mergeUrlCredentials({ url: 'not a url', urlPassword: 'x' })).toThrow(/URL 无效/);
   });

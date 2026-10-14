@@ -1,5 +1,42 @@
 # Changelog — dsh-db-tool
 
+## 1.8.0
+
+新增 SQL Server 数据库支持（适配器 + 传输 + 侧边栏方言接入）。
+
+### 新增
+
+- **SQL Server 适配器**：覆盖 SQL Server 2008/2008R2 → 2022 与 Azure SQL Database；对外占位符统一 `?`（适配器内部按顺序重写为 `@p1..@pN`），标识符 `[x]`（名中 `]` 双写为 `]]`），分页按 `SERVERPROPERTY('ProductMajorVersion')` 分流（2012+ 用 `OFFSET/FETCH`，2008/2008R2 降级 `ROW_NUMBER`），库/表/列元数据只走 `sys.*` catalog views 且仅用 2005+ 通用写法。
+- **连接与认证**：连接串形态 `sqlserver://user:password@host:port/db`，支持 query 参数 `encrypt` / `trustServerCertificate` / `tdsVersion`（默认 `7_4`，可配 `7_3_A`/`7_3_B`/`7_2`/`7_1`）/ `instanceName` / `useUTC`；仅 SQL 认证。
+- **数据传输**：参数化多行 `VALUES` INSERT（TDS 单语句 2100 参数上限、`VALUES` 单语句 1000 行上限，每语句行数取两者最小值）、`MERGE` 处理 replace/ignore、建表 DDL 在显式事务中可回滚；传输分页按目标库版本分流（2012+ `OFFSET/FETCH`，2008/2008R2 降级 `SELECT TOP (n)` / `ROW_NUMBER()` 子查询），**2008/2008R2 同样可传**。
+- **危险语句分类**：新增 T-SQL 专属危险首词 `BACKUP` / `RESTORE` / `DBCC` / `RECONFIGURE` / `BULK INSERT` / `SHUTDOWN` / `xp_cmdshell` 与其他 `xp_*` / `sp_configure`；另新增 `SELECT ... INTO <表|#临时表>` 判危险（T-SQL 建表副作用；表变量/变量赋值 `SELECT 1 INTO @t` 放行，`INSERT INTO ...` 仍按 DML 口径）。
+- **SQL 控制台**：sqlserver 方言接入 CodeMirror（`@codemirror/lang-sql` 的 MSSQL 方言）与 sql-formatter（`transactsql`），表列元数据补全同样生效（上限 50 表）。
+- **驱动形态**：`mssql@12` 只在 devDependencies，运行时加载 `npm run build:sqlserver` 生成的 `vendor/sqlserver-driver.cjs`（mssql → tedious → bl → readable-stream 会把 buffer/events/process/string_decoder 带进生产依赖树，触发宿主 `dsh-app-boot` 的 `require.resolve.paths` bug）。
+
+### 安全加固
+
+- **ro 只读闸门加固为五道**：首词白名单 + 拒绝多语句（词法级：顶层分号后出现任何内容即拒）+ 拒绝 `SELECT ... INTO`（token 级，字符串/方括号标识符/注释内的 into 不误伤）+ 拒绝 `WITH ... (INSERT|UPDATE|DELETE|MERGE)` + 拒绝 `OPENQUERY`/`OPENROWSET`/`OPENDATASOURCE`（其字符串参数在远端/外部数据源执行任意语句、不可审计，连合法只读远端查询也一律拒）。
+- **错误消息脱敏**：连接 URL 解析失败时错误文案里的 userinfo 先脱敏，不再回显明文密码（错误会进 `audit.jsonl` 与模型上下文）。
+- **分页上界修复**：`preview` 的 `OFFSET/FETCH` 绑定值修正为上界 `offset + limit`（此前误传 `limit`，`offset > 0` 时第 2 页起恒为空）。
+
+### 修复
+
+- **mysql 跨库路由**：适配器此前在 `query` / `execute` 中丢弃 `database` 参数，控制台选库后 SQL 仍跑在连接默认库（`USE` 在池上因连接随机复用结果不确定）；现按库名建池缓存路由（与 pg/gaussdb/sqlserver 同构），`close` 级联关闭全部跨库池，事务仍粘主池（服务层已拒绝事务携带 database）。
+- **列库失败静默**：SQL 控制台的跨库下拉在 `listDatabases` 失败时整体消失且无提示（呈现为"无法选择数据库"）；现改为可见错误 + 重试，加载中/失败不再静默。
+
+### 边界（如实记录）
+
+- **仅 SQL 认证**：不支持 Windows 集成认证，也不支持 Azure AD 认证；不接受 ADO.NET 键值连接串（`Server=...;Database=...`）。
+- **ro 只读强度弱于 MySQL/PG**：SQL Server 无等价的会话级只读语句，ro 下适配器 query 闸门五道（首词白名单 + 拒绝多语句 + 拒绝 `SELECT ... INTO` + 拒绝 `WITH` 写体 + 拒绝 `OPENQUERY`/`OPENROWSET`/`OPENDATASOURCE`），另加服务层拦 `execute`；guard 层对 `SELECT ... INTO` 与 `WITH` 写体还会要求确认——不等同于数据库侧的只读会话。
+- **类型搬运取舍**：`hierarchyid` / `geometry` / `geography` 按二进制搬运，目标端建 `VARBINARY(MAX)`，**UDT 类型语义不保留**；`sql_variant` 转文本（`CONVERT(nvarchar(max), col)`），**原类型信息丢失**；源 `varchar`/`char` 长度 4001–8000 映射为目标 `NVARCHAR(MAX)` 类（保容量、不收窄）；`datetime2` 读端 `CONVERT(nvarchar(33), col, 126)`、`time` 用 `CONVERT(nvarchar(16), col, 126)` 保真。
+- **传输在 SQL Server 2008/2008R2 同样可用**：2012+ 走 `OFFSET/FETCH`，2008/2008R2 有序游标（keyset/range）走 `SELECT TOP (n) ... ORDER BY key`，无分片键的 offset 全序与 `keyAt` 切块走 `ROW_NUMBER() OVER (...)` 子查询，版本探测失败按 0 保守降级。
+- **IDENTITY 写入限制**：目标表已存在且该列为 IDENTITY 时，写入显式值报 544（当前不自动 `SET IDENTITY_INSERT ON`）；传输自动建表不生成 IDENTITY 列。
+- **decimal 精度分侧**：浏览侧（query/preview/数据浏览）不保证 decimal/numeric 逐位保真（驱动解析阶段已转 JS number，>15 有效位丢精度；转字符串只防后续数值化，>1e21 出现科学计数法）；传输读端用 `CONVERT(nvarchar(64), col)` 保真搬运。
+- **2008/2008R2 连接通常需 `?trustServerCertificate=true`**：默认 `encrypt=true` + `trustServerCertificate=false`（同 mssql 官方默认），旧实例自签名证书 / 仅 TLS 1.0 会握手失败（Node 默认最低 TLSv1.2）；服务器未强制加密时也可 `?encrypt=false`，并建议显式 `?tdsVersion=7_3_A`（2008）/ `7_3_B`（2008R2）。
+- **`GO n` 重复上限 1000**：SQL 控制台按 sqlcmd 语义把上一批重复执行 n 次（`GO` 行本身不产生语句），重复计数上限 1000，超出部分被截断，防止一次执行被放大成天量请求。
+- **未经真机验证**：本版 SQL Server 只交付离线单测（Fake 驱动），真机冒烟开关为 `DBT_TEST_SQLSERVER_URL`（形如 `sqlserver://sa:pw@host:1433/db`）。
+- **不支持 SQL Server 2005（9.x）及更早版本**；`tdsVersion=8_0`（TDS 8.0）与 `encrypt='strict'`（严格加密）也未支持——SQL Server 2022 用默认 `7_4` 即可正常连接（TDS 8.0 属后续增强），2005 及更早未验证。
+
 ## 1.6.0
 
 新增连接管理「导出 / 导入」：一键导出全部连接（含密码）为口令加密文件，跨机器迁移；导入按口令解密，冲突连接跳过不覆盖。

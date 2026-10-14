@@ -218,3 +218,115 @@ describe('fmtMs', () => {
 		expect(T.fmtMs(5999)).toBe('6.00 s');
 	});
 });
+
+describe('sqlserver（T-SQL）控制台工具', () => {
+	it('fmtDialectOf 映射到 sql-formatter 的 transactsql', () => {
+		expect(T.fmtDialectOf('sqlserver')).toBe('transactsql');
+	});
+
+	it('GO 独占一行作批分隔符：大小写不敏感、不产生语句、前后语句分离', () => {
+		const sql = 'CREATE TABLE t (id INT)\nGO\nINSERT INTO t VALUES (1)\ngo\nSELECT 1';
+		const r = T.splitSqlStatements(sql, 'sqlserver');
+		expect(r).toHaveLength(3);
+		expect(r[0].text).toBe('CREATE TABLE t (id INT)');
+		expect(r[1].start).toBe(sql.indexOf('INSERT')); // start 跳过 GO 行及其换行
+		expect(r[2].text).toBe('\nSELECT 1');
+	});
+
+	it('GO 带重复计数按「总数」语义展开上一批，行首缩进同样识别', () => {
+		const r = T.splitSqlStatements('SELECT 1\n  go 3  \nSELECT 2', 'sqlserver');
+		expect(r.map((x: any) => x.text)).toEqual(['SELECT 1', 'SELECT 1', 'SELECT 1', '\nSELECT 2']);
+	});
+
+	it('GO n 展开：GO 3/go 2/GO 1/GO 0 与行尾注释组合', () => {
+		const c = (sql: string) => T.splitSqlStatements(sql, 'sqlserver').map((x: any) => x.text);
+		expect(c('SELECT 1\nGO 3\nSELECT 2')).toEqual(['SELECT 1', 'SELECT 1', 'SELECT 1', '\nSELECT 2']);
+		expect(c('SELECT 1\ngo 2')).toEqual(['SELECT 1', 'SELECT 1']);
+		expect(c('SELECT 1\nGO 1')).toEqual(['SELECT 1']); // GO 1 等同不带计数
+		expect(c('SELECT 1\nGO 0')).toEqual(['SELECT 1']); // 非法计数按 1 处理，不吞语句
+		expect(c('SELECT 1\nGO 2 -- 重复两次\nSELECT 2')).toEqual(['SELECT 1', 'SELECT 1', '\nSELECT 2']);
+	});
+
+	it('GO n 展开的多语句批：整批按计数重复，且不复用同一对象引用', () => {
+		const r = T.splitSqlStatements('SELECT 1; SELECT 2\nGO 2', 'sqlserver');
+		expect(r.map((x: any) => x.text)).toEqual(['SELECT 1', ' SELECT 2', 'SELECT 1', ' SELECT 2']);
+		expect(r[0]).not.toBe(r[2]);
+	});
+
+	it('GO 行尾注释（GO -- c）仍识别为批分隔符', () => {
+		const sql = 'SELECT 1\nGO -- c\nSELECT 2';
+		const r = T.splitSqlStatements(sql, 'sqlserver');
+		expect(r).toHaveLength(2);
+		expect(r[0].text).toBe('SELECT 1');
+		expect(r[1].text).toBe('\nSELECT 2');
+	});
+
+	it('反斜杠转义仅 MySQL 语义：sqlserver/postgresql 按标准 SQL（单引号内 \\ 是普通字符）', () => {
+		const sql = "SELECT 'C:\\temp\\' AS p; SELECT 2;";
+		// mysql：\' 视为转义 → 字符串未闭合，整段并成 1 条
+		expect(T.splitSqlStatements(sql, 'mysql')).toHaveLength(1);
+		// sqlserver/postgresql：\ 是普通字符，'C:\temp\' 正常闭合 → 2 条
+		const r = T.splitSqlStatements(sql, 'sqlserver');
+		expect(r).toHaveLength(2);
+		expect(r[1].text).toBe(' SELECT 2');
+		expect(T.splitSqlStatements(sql, 'postgresql')).toHaveLength(2);
+		// 双写单引号才是标准 SQL 的转义，各 kind 一致
+		expect(T.splitSqlStatements("SELECT 'it''s;x'; SELECT 2;", 'sqlserver')).toHaveLength(2);
+	});
+
+	it('行内 GO 不是分隔符：语句保持完整', () => {
+		const sql = 'SELECT 1 GO 2\nSELECT 2';
+		const r = T.splitSqlStatements(sql, 'sqlserver');
+		expect(r).toHaveLength(1);
+		expect(r[0].text).toBe(sql);
+	});
+
+	it("引号串内的 'GO' 不切分", () => {
+		const r = T.splitSqlStatements("SELECT 'GO' AS a; SELECT 2;", 'sqlserver');
+		expect(r).toHaveLength(2);
+	});
+
+	it('GO 仅 sqlserver 生效：mysql/postgresql 下 GO 是普通词', () => {
+		expect(T.splitSqlStatements('SELECT 1\nGO\nSELECT 2;', 'mysql')).toHaveLength(1);
+		expect(T.splitSqlStatements('SELECT 1\nGO\nSELECT 2;', 'postgresql')).toHaveLength(1);
+	});
+
+	it('[方括号] 标识符内分号不切分，]] 是转义（非结束）', () => {
+		const a = T.splitSqlStatements('SELECT [a;b] FROM t; SELECT 2;', 'sqlserver');
+		expect(a).toHaveLength(2);
+		expect(a[1].start).toBe('SELECT [a;b] FROM t; SELECT 2;'.indexOf('SELECT 2'));
+		const b = T.splitSqlStatements('SELECT [a]]b;c] FROM t; SELECT 2;', 'sqlserver');
+		expect(b).toHaveLength(2);
+		expect(b[0].text).toBe('SELECT [a]]b;c] FROM t');
+	});
+
+	it('未闭合的 [ 吞掉其余内容（与未闭合引号同语义）', () => {
+		expect(T.splitSqlStatements('SELECT [a;b; SELECT 2;', 'sqlserver')).toHaveLength(1);
+	});
+
+	it('[ 仅 sqlserver 生效：mysql 下为普通字符，分号照常切分', () => {
+		const r = T.splitSqlStatements('SELECT [a;b]; SELECT 2;', 'mysql');
+		expect(r).toHaveLength(3);
+		expect(r[0].text).toBe('SELECT [a');
+		expect(r[1].text).toBe('b]');
+	});
+});
+
+/* 构建产物方言接线：CM6 无法在 node 单测内实例化（console-view.spec 用 fake 模块替身），
+ * 故此处只做「改脚本必须重建产物」的护栏——否则运行时静默降级 textarea / 无高亮。 */
+describe('codemirror 方言接线（构建脚本 + vendor 产物）', () => {
+	const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '../..');
+
+	it('build-codemirror.mjs：sqlserver 接入 lang-sql MSSQL 与 sql-formatter transactsql', () => {
+		const script = readFileSync(join(repoRoot, 'scripts/build-codemirror.mjs'), 'utf8');
+		expect(script).toMatch(/sqlserver:\s*MSSQL,/);
+		expect(script).toMatch(/sqlserver:\s*fmtTransactsql,/);
+		expect(script).toContain('transactsql as fmtTransactsql');
+	});
+
+	it('vendor/codemirror-sql.cjs 已用新脚本重建（含 sqlserver 接线）', () => {
+		const vendor = readFileSync(join(repoRoot, 'vendor/codemirror-sql.cjs'), 'utf8');
+		expect(vendor).toContain('sqlserver');
+		expect(vendor).toContain('transactsql');
+	});
+});

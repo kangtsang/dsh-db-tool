@@ -17,7 +17,8 @@ export type DbKind =
   | 'redis'
   | 'mongodb'
   | 'oracle'
-  | 'dmdb';
+  | 'dmdb'
+  | 'sqlserver';
 
 /** 连接级权限模式 */
 export type AccessMode = 'ro' | 'rw';
@@ -106,7 +107,7 @@ export interface DatabaseAdapter {
   /** 只读查询。MySQL `?` / PG `$1` / Oracle·DM `:name` 占位符；
    *  Redis 传命令数组（JSON 字符串，如 '["GET","key"]' 或 "GET key"）；
    *  Mongo 传 BSON 文档（JSON 字符串，如 '{"find":"users","filter":{}}'）。
-   *  database：可选目标库（Navicat 式跨库操控）。当前仅 pg/gaussdb 实现按库名
+   *  database：可选目标库（Navicat 式跨库操控）。pg/gaussdb/mysql/sqlserver 实现按库名
    *  路由到独立连接池（ro 池同样强制只读）；其余适配器忽略。 */
   query(sql: string, params?: unknown[], database?: string): Promise<QueryResult>;
 

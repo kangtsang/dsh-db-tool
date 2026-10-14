@@ -1,0 +1,1178 @@
+/**
+ * SQL Server 适配器离线单测（不连真机，用户已明确不提供实例）。
+ *
+ * 两种既有手法混合：
+ *  - 手法 A（无 mock，参照 mysql-offline.test.ts）：配置/校验路径在触达驱动与网络之前必抛，
+ *    断言用双断言（既匹配错误标签，又断言不含不该出现的词），防止「错误类型漂移」无声通过。
+ *  - 手法 B（参照 pg-like.test.ts:14-90）：手写 Fake ConnectionPool/Request/Transaction，
+ *    经 createSqlserverAdapter 的 opts.driver 注入（生产路径仍走 vendor bundle），
+ *    断言精确 SQL 文本与绑定参数。
+ */
+import { describe, expect, it } from 'vitest';
+import {
+  createSqlserverAdapter,
+  openSqlserverRaw,
+  type SqlDriver,
+  type SqlPool,
+  type SqlQueryResult,
+  type SqlRecordset,
+  type SqlRequest,
+  type SqlTransaction,
+} from '../../lib/adapters/sqlserver/index.js';
+import type { DatabaseAdapter, ResolvedConnection } from '../../lib/adapters/types.js';
+
+type Row = Record<string, unknown>;
+type ColMeta = Record<string, { type?: unknown }>;
+
+/* ---------------- Fake 驱动（手法 B） ---------------- */
+
+/** Fake Request：记录 input 绑定与执行的 SQL，应答按队列出队 */
+class FakeRequest implements SqlRequest {
+  inputs: Array<{ name: string; type?: unknown; value: unknown }> = [];
+  executed: Array<{ sql: string; binds: Array<[string, unknown]> }> = [];
+  private readonly queue: SqlQueryResult[];
+  private readonly failWith: unknown;
+
+  constructor(queueRef: SqlQueryResult[], failWith?: unknown) {
+    this.queue = queueRef;
+    this.failWith = failWith;
+  }
+
+  input(name: string, ...rest: unknown[]): SqlRequest {
+    this.inputs.push(rest.length >= 2 ? { name, type: rest[0], value: rest[1] } : { name, value: rest[0] });
+    return this;
+  }
+
+  async query(sql: string): Promise<SqlQueryResult> {
+    this.executed.push({ sql, binds: this.inputs.map((i) => [i.name, i.value] as [string, unknown]) });
+    if (this.failWith !== undefined) throw this.failWith;
+    return this.queue.shift() ?? { recordset: [], rowsAffected: [0] };
+  }
+}
+
+class FakePool implements SqlPool {
+  requests: FakeRequest[] = [];
+  queue: SqlQueryResult[] = [];
+  failWith: unknown;
+  /** 按请求顺序注入错误（先于 failWith；数组耗尽后回落 failWith）：模拟「仅某一次请求失败」 */
+  failSeq: unknown[] = [];
+  connectCalls = 0;
+  closed = 0;
+  errorHandlers: Array<(...args: never[]) => void> = [];
+
+  constructor(readonly config: Record<string, unknown>) {}
+
+  request(): SqlRequest {
+    const fail = this.failSeq.length > 0 ? this.failSeq.shift() : this.failWith;
+    const r = new FakeRequest(this.queue, fail);
+    this.requests.push(r);
+    return r;
+  }
+
+  async connect(): Promise<unknown> {
+    this.connectCalls++;
+    return this;
+  }
+
+  async close(): Promise<unknown> {
+    this.closed++;
+    return this;
+  }
+
+  on(event: string, cb: (...args: never[]) => void): unknown {
+    if (event === 'error') this.errorHandlers.push(cb);
+    return this;
+  }
+
+  /** 最近一次请求（无请求则抛错，避免 undefined 静默通过断言） */
+  get last(): FakeRequest {
+    const r = this.requests[this.requests.length - 1];
+    if (!r) throw new Error('FakePool 尚无请求');
+    return r;
+  }
+}
+
+class FakeTransaction implements SqlTransaction {
+  events: string[] = [];
+  requests: FakeRequest[] = [];
+  constructor(private readonly pool: FakePool) {}
+  async begin(): Promise<unknown> {
+    this.events.push('begin');
+    return this;
+  }
+  async commit(): Promise<unknown> {
+    this.events.push('commit');
+    return this;
+  }
+  async rollback(): Promise<unknown> {
+    this.events.push('rollback');
+    return this;
+  }
+  request(): SqlRequest {
+    const r = new FakeRequest(this.pool.queue, this.pool.failWith);
+    this.requests.push(r);
+    return r;
+  }
+}
+
+interface Harness {
+  driver: SqlDriver;
+  pools: FakePool[];
+  txs: FakeTransaction[];
+  configs: Array<Record<string, unknown>>;
+  types: Record<string, unknown>;
+}
+
+function harness(): Harness {
+  const pools: FakePool[] = [];
+  const txs: FakeTransaction[] = [];
+  const configs: Array<Record<string, unknown>> = [];
+  const types: Record<string, unknown> = {
+    Decimal: { t: 'Decimal' },
+    Numeric: { t: 'Numeric' },
+    BigInt: { t: 'BigInt' },
+    UniqueIdentifier: { t: 'UniqueIdentifier' },
+  };
+  const driver = {
+    ConnectionPool: function (config: Record<string, unknown>) {
+      const p = new FakePool(config ?? {});
+      configs.push(config ?? {});
+      pools.push(p);
+      return p;
+    },
+    Transaction: function (pool: SqlPool) {
+      const t = new FakeTransaction(pool as FakePool);
+      txs.push(t);
+      return t;
+    },
+    TYPES: types,
+  } as unknown as SqlDriver;
+  return { driver, pools, txs, configs, types };
+}
+
+/** 构造带 columns 元数据的结果集（真实 mssql 把 columns 挂在 recordset 数组上） */
+function rec(rows: Row[], columns?: ColMeta): SqlQueryResult {
+  const recordset = rows.slice() as SqlRecordset;
+  if (columns) recordset.columns = columns;
+  return { recordset, rowsAffected: [rows.length] };
+}
+
+function cols(...names: string[]): ColMeta {
+  return Object.fromEntries(names.map((n) => [n, {}]));
+}
+
+const BASE_URL = 'sqlserver://sa:p%40ss@db1.example.com:1433/appdb';
+
+function connByUrl(url: string): ResolvedConnection {
+  return { meta: { id: 'sqlserver-offline', kind: 'sqlserver' }, url };
+}
+
+function connByFields(fields: Record<string, unknown>): ResolvedConnection {
+  return { meta: { id: 'sqlserver-offline', kind: 'sqlserver' }, fields };
+}
+
+async function make(mode?: 'ro', url = BASE_URL) {
+  const h = harness();
+  const a = await createSqlserverAdapter(connByUrl(url), { driver: h.driver, ...(mode ? { mode } : {}) });
+  const pool = h.pools[0];
+  if (!pool) throw new Error('未创建主池');
+  return { h, a, pool };
+}
+
+function msgOf(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/* ---------------- 手法 A：配置校验（触网前必抛） ---------------- */
+
+describe('sqlserver 配置校验（离线，手法 A）', () => {
+  it('缺少 url 与 fields：抛中文配置错误，不误报驱动缺失', async () => {
+    const err = await createSqlserverAdapter({ meta: { id: 'x', kind: 'sqlserver' } }).then(
+      () => {
+        throw new Error('应当抛错');
+      },
+      (e: unknown) => e,
+    );
+    const msg = msgOf(err);
+    expect(msg).toMatch(/缺少 url 或 fields/);
+    // 双断言：配置错误不能在驱动加载之后才报（否则用户会照 build 指引白跑一趟）
+    expect(msg).not.toMatch(/驱动|vendor|build:sqlserver/);
+  });
+
+  it('非法 tdsVersion：抛中文错误而非静默回退', async () => {
+    const h = harness();
+    const err = await createSqlserverAdapter(connByUrl(`${BASE_URL}?tdsVersion=9_9`), {
+      driver: h.driver,
+    }).then(
+      () => {
+        throw new Error('应当抛错');
+      },
+      (e: unknown) => e,
+    );
+    expect(msgOf(err)).toMatch(/tdsVersion/);
+    expect(msgOf(err)).not.toMatch(/连接超时|登录失败/);
+  });
+
+  it('非法 encrypt 取值：抛中文错误', async () => {
+    const h = harness();
+    await expect(
+      createSqlserverAdapter(connByUrl(`${BASE_URL}?encrypt=maybe`), { driver: h.driver }),
+    ).rejects.toThrow(/encrypt/);
+  });
+
+  it('URL 解析失败：错误消息脱敏（不含明文密码），但仍可定位问题', async () => {
+    const h = harness();
+    const err = await createSqlserverAdapter(connByUrl('sqlserver://sa:S3cretPwd@host:99999/db'), {
+      driver: h.driver,
+    }).then(
+      () => {
+        throw new Error('应抛错');
+      },
+      (e: unknown) => e,
+    );
+    const msg = msgOf(err);
+    // 该消息会进 audit.jsonl 与模型上下文：密码绝不能出现
+    expect(msg).not.toMatch(/S3cretPwd/);
+    // 仍能定位：保留 scheme 与 host，给出形态说明
+    expect(msg).toMatch(/\*\*\*@host/);
+    expect(msg).toMatch(/sqlserver:\/\//);
+    expect(msg).toMatch(/期望形态/);
+  });
+});
+
+/* ---------------- 手法 B：URL / fields → 池配置 ---------------- */
+
+describe('sqlserver URL / fields 解析（手法 B）', () => {
+  it('URL 全参数：映射为 mssql 池配置（含 percent 编码凭据解码）', async () => {
+    const h = harness();
+    const a = await createSqlserverAdapter(
+      connByUrl(`${BASE_URL}?encrypt=true&trustServerCertificate=true&tdsVersion=7_3_A&instanceName=SQLEXPRESS&useUTC=false`),
+      { driver: h.driver },
+    );
+    const cfg = h.configs[0]!;
+    expect(cfg).toMatchObject({ server: 'db1.example.com', port: 1433, user: 'sa', password: 'p@ss', database: 'appdb' });
+    expect(cfg.options).toMatchObject({
+      encrypt: true,
+      trustServerCertificate: true,
+      tdsVersion: '7_3_A',
+      instanceName: 'SQLEXPRESS',
+      useUTC: false,
+    });
+    await a.close();
+  });
+
+  it('URL 默认值：encrypt=true / trustServerCertificate=false / tdsVersion=7_4 / useUTC=true / port=1433', async () => {
+    const { h, a } = await make();
+    const cfg = h.configs[0]!;
+    expect(cfg.port).toBe(1433);
+    expect((cfg.options as Record<string, unknown>).instanceName).toBeUndefined();
+    expect(cfg.options).toMatchObject({
+      encrypt: true,
+      trustServerCertificate: false,
+      tdsVersion: '7_4',
+      useUTC: true,
+    });
+    await a.close();
+  });
+
+  it('URL query 参数名大小写不敏感', async () => {
+    const h = harness();
+    const a = await createSqlserverAdapter(connByUrl(`${BASE_URL}?TrustServerCertificate=TRUE&TDSVERSION=7_1`), {
+      driver: h.driver,
+    });
+    expect(h.configs[0]!.options).toMatchObject({ trustServerCertificate: true, tdsVersion: '7_1' });
+    await a.close();
+  });
+
+  it('fields 模式：host/port/user/password/database，缺省端口 1433', async () => {
+    const h = harness();
+    const a = await createSqlserverAdapter(connByFields({ host: 'h2', user: 'u', password: 'p', database: 'd' }), {
+      driver: h.driver,
+    });
+    expect(h.configs[0]).toMatchObject({ server: 'h2', port: 1433, user: 'u', password: 'p', database: 'd' });
+    await a.close();
+  });
+
+  it('fields.database 覆盖 URL 库名（传输端跨库定位依赖此口径，防静默连回原库）', async () => {
+    const h = harness();
+    const a = await createSqlserverAdapter(
+      { meta: { id: 'sqlserver-offline', kind: 'sqlserver' }, url: BASE_URL, fields: { database: 'otherdb' } },
+      { driver: h.driver },
+    );
+    expect(h.configs[0]).toMatchObject({ database: 'otherdb' });
+    const raw = await openSqlserverRaw(
+      { meta: { id: 'sqlserver-offline', kind: 'sqlserver' }, url: BASE_URL, fields: { database: 'otherdb' } },
+      h.driver,
+    );
+    expect(raw.database).toBe('otherdb');
+    expect(h.configs[1]).toMatchObject({ database: 'otherdb' });
+    await a.close();
+    await raw.pool.close();
+  });
+
+  it('URL 无 path 段：不指定库（连登录默认库），raw.database 为空串', async () => {
+    const h = harness();
+    const raw = await openSqlserverRaw(connByUrl('sqlserver://sa:pw@h:1433'), h.driver);
+    expect(raw.database).toBe('');
+    expect(h.configs[0]!['database']).toBeUndefined();
+    await raw.ready();
+    await raw.pool.close();
+  });
+
+  it('conn.ssl=true 等价 encrypt=true（与 mysql/pg 适配器对 ssl 的处理一致）', async () => {
+    const h = harness();
+    const a = await createSqlserverAdapter(
+      { meta: { id: 'sqlserver-offline', kind: 'sqlserver' }, url: BASE_URL, ssl: true },
+      { driver: h.driver },
+    );
+    expect(h.configs[0]!.options).toMatchObject({ encrypt: true });
+    await a.close();
+  });
+
+  it('池必须注册 error 监听（无监听器时 mssql 的 emit 会崩宿主进程）', async () => {
+    const { a, pool } = await make();
+    expect(pool.errorHandlers.length).toBeGreaterThan(0);
+    expect(() => pool.errorHandlers.forEach((cb) => cb(new Error('mock 空闲连接故障') as never))).not.toThrow();
+    await a.close();
+  });
+
+  it('openSqlserverRaw：返回 { pool, database, driver }（传输端复用面）', async () => {
+    const h = harness();
+    const raw = await openSqlserverRaw(connByUrl(BASE_URL), h.driver);
+    expect(raw.database).toBe('appdb');
+    expect(raw.driver).toBe(h.driver);
+    expect(h.pools[0]!.errorHandlers.length).toBeGreaterThan(0);
+    expect(h.configs[0]).toMatchObject({ database: 'appdb' });
+    await raw.pool.close();
+  });
+});
+
+/* ---------------- 手法 B：? → @pN 重写 ---------------- */
+
+describe('sqlserver ? → @pN 重写（手法 B）', () => {
+  it('基本顺序重写 + request.input 绑定', async () => {
+    const { a, pool } = await make();
+    pool.queue = [rec([{ n: 1 }], cols('n'))];
+    await a.query('SELECT * FROM t WHERE a = ? AND b = ?', [1, 'x']);
+    expect(pool.last.executed[0]!.sql).toBe('SELECT * FROM t WHERE a = @p1 AND b = @p2');
+    expect(pool.last.executed[0]!.binds).toEqual([
+      ['p1', 1],
+      ['p2', 'x'],
+    ]);
+    await a.close();
+  });
+
+  const SKIP_CASES: Array<[string, string, string]> = [
+    ['单引号字符串内的 ?', "SELECT ? AS p, 'a?b' AS v", "SELECT @p1 AS p, 'a?b' AS v"],
+    ['N 前缀字符串与双单引号转义', "SELECT ? AS p, N'it''s ?' AS v", "SELECT @p1 AS p, N'it''s ?' AS v"],
+    ['方括号标识符 [we?ird]', 'SELECT ? AS p, [we?ird] FROM t', 'SELECT @p1 AS p, [we?ird] FROM t'],
+    ['方括号内 ]] 转义', 'SELECT ? AS p, [a]]?b] FROM t', 'SELECT @p1 AS p, [a]]?b] FROM t'],
+    ['双引号标识符', 'SELECT ? AS p, "qu?oted" FROM t', 'SELECT @p1 AS p, "qu?oted" FROM t'],
+    ['-- 行注释', 'SELECT ? AS p -- ? 注释\nFROM t', 'SELECT @p1 AS p -- ? 注释\nFROM t'],
+    ['/* */ 块注释', 'SELECT /* ? */ ? AS p FROM t', 'SELECT /* ? */ @p1 AS p FROM t'],
+  ];
+  it.each(SKIP_CASES)('%s：? 不被重写', async (_label, sql, expected) => {
+    const { a, pool } = await make();
+    pool.queue = [rec([], {})];
+    await a.query(sql, [7]);
+    expect(pool.last.executed[0]!.sql).toBe(expected);
+    expect(pool.last.executed[0]!.binds).toEqual([['p1', 7]]);
+    await a.close();
+  });
+
+  it('占位符多于参数：抛中文错误（不触达驱动）', async () => {
+    const { a, pool } = await make();
+    await expect(a.query('SELECT ? , ?', [1])).rejects.toThrow(/占位符/);
+    expect(pool.requests).toHaveLength(0);
+    await a.close();
+  });
+
+  it('参数多于占位符：抛中文错误', async () => {
+    const { a } = await make();
+    await expect(a.query('SELECT 1', [1])).rejects.toThrow(/占位符/);
+    await a.close();
+  });
+
+  it('无参数语句正常执行（占位符 0 个）', async () => {
+    const { a, pool } = await make();
+    pool.queue = [rec([{ n: 1 }], cols('n'))];
+    const r = await a.query('SELECT 1 AS n');
+    expect(pool.last.executed[0]!.sql).toBe('SELECT 1 AS n');
+    expect(pool.last.executed[0]!.binds).toEqual([]);
+    expect(r.rowCount).toBe(1);
+    await a.close();
+  });
+
+  it('? 与 @pN 混用：抛中文错误（不静默错值）', async () => {
+    const { a, pool } = await make();
+    await expect(a.query('SELECT * FROM t WHERE a = @p1 AND b = ?', [1])).rejects.toThrow(/混用/);
+    await expect(a.execute('UPDATE t SET a = @p1 WHERE b = ?', [1])).rejects.toThrow(/混用/);
+    expect(pool.requests).toHaveLength(0);
+    await a.close();
+  });
+
+  it('@@ 系统变量不算混用（不误报）', async () => {
+    const { a, pool } = await make();
+    pool.queue = [rec([{ v: 'x' }], cols('v'))];
+    await expect(a.query('SELECT @@VERSION AS v, ? AS p', ['x'])).resolves.toBeDefined();
+    expect(pool.last.executed[0]!.binds).toEqual([['p1', 'x']]);
+    await a.close();
+  });
+
+  it('混用判定矩阵：@p1/@P1 算命名占位符；@p1x/@p/@@p1 不算（不误报合法标识符）', async () => {
+    const { a, pool } = await make();
+    pool.queue = [rec([{ v: 1 }], cols('v')), rec([{ v: 1 }], cols('v')), rec([{ v: 1 }], cols('v'))];
+    const cases: Array<[string, boolean]> = [
+      ['SELECT @p1 + ?', true],
+      ['SELECT @P1 + ?', true],
+      ['SELECT @p1x + ?', false],
+      ['SELECT @p + ?', false],
+      ['SELECT @@p1 + ?', false],
+    ];
+    for (const [sql, wantMix] of cases) {
+      const err = await a.query(sql, [1]).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      if (wantMix) expect(msgOf(err), sql).toMatch(/混用/);
+      else expect(err, sql).toBeNull();
+    }
+    await a.close();
+  });
+});
+
+/* ---------------- ro 只读（诚实降级：白名单 + 拒绝多语句） ---------------- */
+
+describe('sqlserver ro 模式（手法 B）', () => {
+  it('写语句被拒（DRIVER_ERROR，且未触达驱动）', async () => {
+    const { a, pool } = await make('ro');
+    for (const stmt of [
+      'UPDATE t SET x = 1',
+      'INSERT INTO t VALUES (1)',
+      'DELETE FROM t',
+      'DROP TABLE t',
+      'ALTER TABLE t ADD c INT',
+      'EXEC sp_who',
+      '/* 注释 */ UPDATE t SET x = 1',
+      '  \n merge into t using s on 1=1 when matched then delete;',
+    ]) {
+      const err = await a.query(stmt).then(
+        () => {
+          throw new Error(`ro 下应拒绝：${stmt}`);
+        },
+        (e: unknown) => e,
+      );
+      expect(msgOf(err)).toMatch(/DRIVER_ERROR[\s\S]*只读/);
+      expect(msgOf(err)).not.toMatch(/超时|登录失败|网络/);
+    }
+    expect(pool.requests).toHaveLength(0);
+    await a.close();
+  });
+
+  it('白名单首词（含大小写与前导注释）放行到驱动层', async () => {
+    const { a, pool } = await make('ro');
+    pool.queue = [rec([{ n: 1 }], cols('n')), rec([{ n: 2 }], cols('n'))];
+    await a.query('  select 1 AS n');
+    await a.query('/* c */ WITH x AS (SELECT 1 AS n) SELECT n FROM x');
+    expect(pool.requests).toHaveLength(2);
+    expect(pool.last.executed[0]!.sql).toMatch(/^\/\* c \*\/ WITH/);
+    await a.close();
+  });
+
+  it('ro 拒绝多语句（防堆叠写），但允许结尾单个分号', async () => {
+    const { a, pool } = await make('ro');
+    pool.queue = [rec([{ n: 1 }], cols('n'))];
+    await expect(a.query('SELECT 1; UPDATE t SET x = 1')).rejects.toThrow(/多条语句/);
+    await expect(a.query("SELECT 'a;b' AS v; -- 尾注释")).resolves.toBeDefined();
+    await expect(a.query('SELECT 1;')).resolves.toBeDefined();
+    expect(pool.requests).toHaveLength(2);
+    await a.close();
+  });
+
+  it('ro：SELECT ... INTO 与 WITH + 写语句被拒（T-SQL 写形态，首词白名单挡不住）', async () => {
+    const { a, pool } = await make('ro');
+    for (const stmt of [
+      'SELECT * INTO dbo.newtbl FROM t',
+      'SELECT * INTO #tmp FROM t',
+      'WITH x AS (SELECT 1 AS n) DELETE FROM t',
+      'WITH x AS (SELECT 1 AS n) UPDATE t SET c = 1',
+      'WITH x AS (SELECT 1 AS n) MERGE t AS s USING x ON 1 = 1 WHEN MATCHED THEN DELETE',
+      'WITH x AS (SELECT 1 AS n) INSERT INTO t (n) SELECT n FROM x',
+    ]) {
+      const err = await a.query(stmt).then(
+        () => {
+          throw new Error(`ro 下应拒绝：${stmt}`);
+        },
+        (e: unknown) => e,
+      );
+      expect(msgOf(err)).toMatch(/DRIVER_ERROR[\s\S]*只读/);
+      expect(msgOf(err)).not.toMatch(/超时|登录失败|网络/);
+    }
+    expect(pool.requests).toHaveLength(0);
+    await a.close();
+  });
+
+  it('ro：字符串/标识符/注释里的 into、delete 不误伤（判定走词法而非裸正则）', async () => {
+    const { a, pool } = await make('ro');
+    pool.queue = [
+      rec([{ a: 1 }], cols('a')),
+      rec([{ a: 1 }], cols('a')),
+      rec([{ a: 1 }], cols('a')),
+      rec([{ a: 1 }], cols('a')),
+    ];
+    await expect(a.query("SELECT 'into 字符串' AS a")).resolves.toBeDefined();
+    await expect(a.query('SELECT [into] FROM t')).resolves.toBeDefined();
+    await expect(a.query("SELECT 'delete from t' AS a")).resolves.toBeDefined();
+    await expect(a.query('/* into delete */ SELECT 1 AS a')).resolves.toBeDefined();
+    expect(pool.requests).toHaveLength(4);
+    await a.close();
+  });
+
+  it('ro：堆叠写必须被 multi 拦下——第二条语句全为标识符/引号也不能漏', async () => {
+    const { a, pool } = await make('ro');
+    for (const stmt of [
+      'SELECT 1;DROP TABLE t',
+      'SELECT 1;DELETE FROM t',
+      'SELECT 1;TRUNCATE TABLE t',
+      ';TRUNCATE TABLE t',
+      "SELECT 1;EXEC xp_cmdshell 'whoami'",
+      "SELECT 1;EXEC sp_executesql N'DROP TABLE t'",
+      "SELECT 1;BULK INSERT t FROM 'c:\\x.csv'",
+      'SELECT 1;SHUTDOWN',
+      'USE db;DROP TABLE t',
+    ]) {
+      const err = await a.query(stmt).then(
+        () => {
+          throw new Error(`ro 下应拒绝：${stmt}`);
+        },
+        (e: unknown) => e,
+      );
+      expect(msgOf(err), stmt).toMatch(/DRIVER_ERROR[\s\S]*(只读|多条语句)/);
+    }
+    expect(pool.requests).toHaveLength(0);
+    await a.close();
+  });
+
+  it('ro：单语句与字符串/注释/方括号内的分号不置 multi（不误拒）', async () => {
+    const { a, pool } = await make('ro');
+    pool.queue = [
+      rec([{ a: 1 }], cols('a')),
+      rec([{ a: 1 }], cols('a')),
+      rec([{ a: 1 }], cols('a')),
+      rec([{ a: 1 }], cols('a')),
+    ];
+    await expect(a.query("SELECT 'a;b' AS a")).resolves.toBeDefined();
+    await expect(a.query('SELECT [a;b] FROM t')).resolves.toBeDefined();
+    await expect(a.query('/* ; */ SELECT 1 AS a')).resolves.toBeDefined();
+    await expect(a.query('SELECT 1;')).resolves.toBeDefined();
+    expect(pool.requests).toHaveLength(4);
+    await a.close();
+  });
+
+  it('ro：OPENQUERY/OPENROWSET/OPENDATASOURCE 一律拒绝（远端语句内容不可审计）', async () => {
+    const { a, pool } = await make('ro');
+    for (const stmt of [
+      "SELECT * FROM OPENQUERY(ls,'EXEC xp_cmdshell ''whoami''')",
+      "SELECT * FROM OPENROWSET('SQLNCLI','Server=x','DELETE FROM t')",
+      "SELECT * FROM OPENDATASOURCE('SQLNCLI','Data Source=x').db.dbo.t",
+    ]) {
+      const err = await a.query(stmt).then(
+        () => {
+          throw new Error(`ro 下应拒绝：${stmt}`);
+        },
+        (e: unknown) => e,
+      );
+      expect(msgOf(err), stmt).toMatch(/OPENQUERY|OPENROWSET|OPENDATASOURCE/);
+    }
+    expect(pool.requests).toHaveLength(0);
+    await a.close();
+  });
+
+  it('ro：普通读表不受 OPEN* 加固影响', async () => {
+    const { a, pool } = await make('ro');
+    pool.queue = [rec([{ id: 1 }], cols('id'))];
+    await expect(a.query('SELECT id FROM t')).resolves.toBeDefined();
+    expect(pool.requests).toHaveLength(1);
+    await a.close();
+  });
+
+  it('ro 跨库池同样受白名单约束', async () => {
+    const { a, h } = await make('ro');
+    await expect(a.query('UPDATE t SET x = 1', [], 'otherdb')).rejects.toThrow(/只读/);
+    expect(h.pools).toHaveLength(1); // 拒绝发生在建跨库池之前
+    await a.close();
+  });
+});
+
+/* ---------------- 分页与版本降级 ---------------- */
+
+describe('sqlserver previewRows 分页（手法 B）', () => {
+  it('>=11：ORDER BY (SELECT NULL) + OFFSET/FETCH，绑定 [offset, limit]', async () => {
+    const { a, pool } = await make();
+    pool.queue = [
+      rec([{ major: 15, version: '15.0.2000.5' }], cols('major', 'version')),
+      rec([{ id: 1 }], cols('id')),
+    ];
+    const r = await a.previewRows('users', 10);
+    const sql = pool.last.executed[0]!.sql;
+    expect(sql).toContain('ORDER BY (SELECT NULL)');
+    expect(sql).toContain('OFFSET @p1 ROWS FETCH NEXT @p2 ROWS ONLY');
+    expect(sql).toContain('[dbo].[users]');
+    expect(pool.last.executed[0]!.binds).toEqual([
+      ['p1', 0],
+      ['p2', 10],
+    ]);
+    expect(r.columns).toEqual(['id']);
+    await a.close();
+  });
+
+  it('<11：ROW_NUMBER 降级，且剔除内部序号列（上界 = off+lim）', async () => {
+    const { a, pool } = await make();
+    pool.queue = [
+      rec([{ major: 10, version: '10.50.1600.1' }], cols('major', 'version')),
+      rec([{ id: 1, __dsh_rn: 1 }, { id: 2, __dsh_rn: 2 }], cols('id', '__dsh_rn')),
+    ];
+    const r = await a.previewRows('users', 5, 'dbo', 2);
+    const sql = pool.last.executed[0]!.sql;
+    expect(sql).toContain('ROW_NUMBER() OVER (ORDER BY (SELECT NULL))');
+    expect(sql).toContain('> @p1 AND t.[__dsh_rn] <= @p2');
+    expect(sql).not.toContain('OFFSET');
+    // 回归锚点：上界必须是 off+lim（曾误写成 lim → off>0 时第 2 页起恒为空）
+    expect(pool.last.executed[0]!.binds).toEqual([
+      ['p1', 2],
+      ['p2', 7],
+    ]);
+    expect(r.columns).toEqual(['id']);
+    expect(r.rows).toEqual([[1], [2]]);
+    await a.close();
+  });
+
+  it('<11 分页上界 = off+lim；off=0 时与 2012+ 分支绑定一致', async () => {
+    // 2012+ 分支（off=0, lim=10）：@p2 = lim
+    const c1 = await make();
+    c1.pool.queue = [
+      rec([{ major: 15, version: '15.0.2000.5' }], cols('major', 'version')),
+      rec([{ id: 1 }], cols('id')),
+    ];
+    await c1.a.previewRows('users', 10, 'dbo', 0);
+    const plusBinds = c1.pool.last.executed[0]!.binds;
+    await c1.a.close();
+
+    // 2008 分支（off=0, lim=10）：off + lim = 10 → 与上面一致
+    const c2 = await make();
+    c2.pool.queue = [
+      rec([{ major: 10, version: '10.50.1600.1' }], cols('major', 'version')),
+      rec([{ id: 1 }], cols('id')),
+    ];
+    await c2.a.previewRows('users', 10, 'dbo', 0);
+    expect(c2.pool.last.executed[0]!.binds).toEqual(plusBinds);
+
+    // 第 2 页（off=50, lim=50）：上界 100，而不是 50
+    await c2.a.previewRows('users', 50, 'dbo', 50);
+    expect(c2.pool.last.executed[0]!.binds).toEqual([
+      ['p1', 50],
+      ['p2', 100],
+    ]);
+    await c2.a.close();
+  });
+
+  it('版本探测报错：按 <11 降级而非打挂 previewRows（与传输端容错对称）', async () => {
+    const { a, pool } = await make();
+    pool.failSeq = [mssqlErr('RequestError', 'EREQUEST', { number: 102, severity: 15, lineNumber: 1 })];
+    pool.queue = [rec([{ id: 1 }], cols('id'))];
+    const r = await a.previewRows('users', 1);
+    expect(pool.last.executed[0]!.sql).toContain('ROW_NUMBER()');
+    expect(r.rowCount).toBe(1);
+    // 探测失败结果按池缓存（0 → 始终降级），不会每次重试打服务器
+    await a.previewRows('users', 1);
+    const probes = pool.requests.filter((q) => q.executed.some((e) => e.sql.includes('SERVERPROPERTY')));
+    expect(probes).toHaveLength(1);
+    await a.close();
+  });
+
+  it('ProductMajorVersion 为 NULL 时回退 ProductVersion 前缀', async () => {
+    const { a, pool } = await make();
+    pool.queue = [
+      rec([{ major: null, version: '10.0.1600.22' }], cols('major', 'version')),
+      rec([{ id: 1 }], cols('id')),
+    ];
+    await a.previewRows('users', 1);
+    expect(pool.last.executed[0]!.sql).toContain('ROW_NUMBER()');
+    await a.close();
+  });
+
+  it('版本探测失败（全 NULL）按 <11 降级，且结果仍能返回', async () => {
+    const { a, pool } = await make();
+    pool.queue = [rec([{ major: null, version: null }], cols('major', 'version')), rec([{ id: 1 }], cols('id'))];
+    const r = await a.previewRows('users', 1);
+    expect(pool.last.executed[0]!.sql).toContain('ROW_NUMBER()');
+    expect(r.rowCount).toBe(1);
+    await a.close();
+  });
+
+  it('版本探测按池缓存：两次预览只探测一次', async () => {
+    const { a, pool } = await make();
+    pool.queue = [
+      rec([{ major: 15, version: '15.0.2000.5' }], cols('major', 'version')),
+      rec([{ id: 1 }], cols('id')),
+      rec([{ id: 2 }], cols('id')),
+    ];
+    await a.previewRows('users', 1);
+    await a.previewRows('users', 1);
+    const probes = pool.requests.filter((r) => r.executed.some((e) => e.sql.includes('SERVERPROPERTY')));
+    expect(probes).toHaveLength(1);
+    await a.close();
+  });
+
+  it('limit/offset 钳制：limit 999→50、limit 0→1、offset -5→0', async () => {
+    const { a, pool } = await make();
+    pool.queue = [
+      rec([{ major: 15, version: '15.0.2000.5' }], cols('major', 'version')),
+      rec([{ id: 1 }], cols('id')),
+      rec([{ id: 1 }], cols('id')),
+      rec([{ id: 1 }], cols('id')),
+    ];
+    await a.previewRows('users', 999);
+    expect(pool.last.executed[0]!.binds).toEqual([
+      ['p1', 0],
+      ['p2', 50],
+    ]);
+    await a.previewRows('users', 0);
+    expect(pool.last.executed[0]!.binds).toEqual([
+      ['p1', 0],
+      ['p2', 1],
+    ]);
+    await a.previewRows('users', 10, 'dbo', -5);
+    expect(pool.last.executed[0]!.binds).toEqual([
+      ['p1', 0],
+      ['p2', 10],
+    ]);
+    await a.close();
+  });
+
+  it('危险表名被安全引用（方括号内 ] 双写）而非字符串拼接注入', async () => {
+    const { a, pool } = await make();
+    pool.queue = [
+      rec([{ major: 15, version: '15.0.2000.5' }], cols('major', 'version')),
+      rec([{ id: 1 }], cols('id')),
+    ];
+    await a.previewRows('we]]ird; DROP TABLE x', 1);
+    const sql = pool.last.executed[0]!.sql;
+    expect(sql).toContain('[dbo].[we]]]]ird; DROP TABLE x]');
+    await a.close();
+  });
+
+  it('含换行的表名被标识符校验拦截（不拼进 SQL、不发请求）', async () => {
+    const { a, pool } = await make();
+    await expect(a.previewRows('a\nb', 1)).rejects.toThrow(/非法/);
+    expect(pool.requests).toHaveLength(0);
+    await a.close();
+  });
+});
+
+/* ---------------- 类型规范化 ---------------- */
+
+describe('sqlserver 类型规范化（手法 B）', () => {
+  it('decimal/numeric/bigint/uniqueidentifier 钉 string，Date→ISO，Buffer→[BLOB n bytes]', async () => {
+    const { a, pool, h } = await make();
+    const T = h.types;
+    pool.queue = [
+      rec(
+        [
+          {
+            d: 123.45,
+            n: 678.9,
+            b: 9007199254740993n,
+            u: '6F9619FF-8B86-D011-B42D-00C04FC964FF',
+            t: new Date('2024-01-02T03:04:05.000Z'),
+            bin: Buffer.from([1, 2, 3]),
+            i: 7,
+            nul: null,
+          },
+        ],
+        {
+          d: { type: T.Decimal },
+          n: { type: T.Numeric },
+          b: { type: T.BigInt },
+          u: { type: T.UniqueIdentifier },
+          t: {},
+          bin: {},
+          i: {},
+          nul: {},
+        },
+      ),
+    ];
+    const r = await a.query('SELECT * FROM t');
+    expect(r.columns).toEqual(['d', 'n', 'b', 'u', 't', 'bin', 'i', 'nul']);
+    expect(r.rows[0]).toEqual([
+      '123.45',
+      '678.9',
+      '9007199254740993',
+      '6F9619FF-8B86-D011-B42D-00C04FC964FF',
+      '2024-01-02T03:04:05.000Z',
+      '[BLOB 3 bytes]',
+      7,
+      null,
+    ]);
+    expect(r.rowCount).toBe(1);
+    await a.close();
+  });
+
+  it('无 columns 元数据时从首行推导列名', async () => {
+    const { a, pool } = await make();
+    pool.queue = [rec([{ b: 2, a: 1 }])];
+    const r = await a.query('SELECT 1');
+    expect(r.columns).toEqual(['b', 'a']);
+    expect(r.rows[0]).toEqual([2, 1]);
+    await a.close();
+  });
+
+  it('空结果集返回 0 行（不抛）', async () => {
+    const { a, pool } = await make();
+    pool.queue = [{ recordset: [], rowsAffected: [0] }];
+    const r = await a.query('SELECT * FROM t WHERE 1 = 0');
+    expect(r.rows).toEqual([]);
+    expect(r.rowCount).toBe(0);
+    await a.close();
+  });
+});
+
+/* ---------------- execute ---------------- */
+
+describe('sqlserver execute（手法 B）', () => {
+  it('affectedRows 取 rowsAffected 求和，并返回中文消息', async () => {
+    const { a, pool } = await make();
+    pool.queue = [{ recordset: [], rowsAffected: [2, 3] }];
+    const r = await a.execute('UPDATE t SET x = ? WHERE id = ?', [1, 2]);
+    expect(r.affectedRows).toBe(5);
+    expect(r.message).toContain('5');
+    expect(pool.last.executed[0]!.sql).toBe('UPDATE t SET x = @p1 WHERE id = @p2');
+    await a.close();
+  });
+
+  it('rowsAffected 缺失时 affectedRows 为 undefined 但不抛', async () => {
+    const { a, pool } = await make();
+    pool.queue = [{ recordset: [] }];
+    const r = await a.execute('CREATE TABLE t (id INT)');
+    expect(r.affectedRows).toBeUndefined();
+    expect(r.message).toMatch(/执行成功/);
+    await a.close();
+  });
+});
+
+/* ---------------- 元数据 ---------------- */
+
+describe('sqlserver 元数据方法（手法 B）', () => {
+  it('testConnect 返回版本串', async () => {
+    const { a, pool } = await make();
+    pool.queue = [rec([{ version: '15.0.2000.5', major: 15, engine: 3 }], cols('version', 'major', 'engine'))];
+    const r = await a.testConnect();
+    expect(r.ok).toBe(true);
+    expect(r.serverInfo).toBe('Microsoft SQL Server 2019 - 15.0.2000.5');
+    expect(pool.last.executed[0]!.sql).toContain("SERVERPROPERTY('ProductVersion')");
+    await a.close();
+  });
+
+  it('listDatabases 排除系统库（database_id > 4）', async () => {
+    const { a, pool } = await make();
+    pool.queue = [rec([{ name: 'appdb' }, { name: 'report' }], cols('name'))];
+    const dbs = await a.listDatabases();
+    expect(dbs).toEqual(['appdb', 'report']);
+    const sql = pool.last.executed[0]!.sql;
+    expect(sql).toContain('sys.databases');
+    expect(sql).toContain('database_id > 4');
+    await a.close();
+  });
+
+  it('listSchemas 排除系统 schema', async () => {
+    const { a, pool } = await make();
+    pool.queue = [rec([{ name: 'dbo' }, { name: 'sales' }], cols('name'))];
+    const schemas = await a.listSchemas!();
+    expect(schemas).toEqual(['dbo', 'sales']);
+    const sql = pool.last.executed[0]!.sql;
+    expect(sql).toContain('sys.schemas');
+    expect(sql).toContain('INFORMATION_SCHEMA');
+    await a.close();
+  });
+
+  it('listTables：sys.objects 限定 schema，类型归一 TABLE/VIEW', async () => {
+    const { a, pool } = await make();
+    pool.queue = [
+      rec([{ table_name: 't1', obj_type: 'U' }, { table_name: 'v1', obj_type: 'V' }], cols('table_name', 'obj_type')),
+    ];
+    const tables = await a.listTables('dbo');
+    expect(tables).toEqual([
+      { name: 't1', type: 'TABLE', database: 'dbo' },
+      { name: 'v1', type: 'VIEW', database: 'dbo' },
+    ]);
+    const sql = pool.last.executed[0]!.sql;
+    expect(sql).toContain('sys.objects');
+    expect(sql).toContain("'U'");
+    expect(sql).toContain("'V'");
+    expect(pool.last.executed[0]!.binds).toEqual([['p1', 'dbo']]);
+    await a.close();
+  });
+
+  it('listTables：跨库目标 "db.schema" 走该库自己的池', async () => {
+    const { a, h } = await make();
+    h.pools[0]!.queue = [rec([{ table_name: 't1', obj_type: 'U' }], cols('table_name', 'obj_type'))];
+    await a.listTables('other.sales');
+    expect(h.pools).toHaveLength(2);
+    expect(h.configs[1]).toMatchObject({ database: 'other' });
+    expect(h.pools[1]!.last.executed[0]!.binds).toEqual([['p1', 'sales']]);
+    await a.close();
+  });
+
+  it('describeTable：主键标 PRI、类型带长度、MS_Description 作 comment', async () => {
+    const { a, pool } = await make();
+    pool.queue = [
+      rec(
+        [
+          { column_id: 1, column_name: 'id', type_name: 'int', max_length: 4, precision: 10, scale: 0, is_nullable: false, default_def: null, comment: '主键' },
+          { column_id: 2, column_name: 'name', type_name: 'nvarchar', max_length: 100, precision: 0, scale: 0, is_nullable: true, default_def: "('x')", comment: null },
+          { column_id: 3, column_name: 'amount', type_name: 'decimal', max_length: 9, precision: 18, scale: 2, is_nullable: true, default_def: null, comment: null },
+        ],
+        cols('column_id', 'column_name', 'type_name', 'max_length', 'precision', 'scale', 'is_nullable', 'default_def', 'comment'),
+      ),
+      rec([{ column_id: 1 }], cols('column_id')),
+    ];
+    const columns = await a.describeTable('users');
+    expect(columns).toEqual([
+      { name: 'id', dataType: 'int', nullable: false, key: 'PRI', default: null, comment: '主键' },
+      { name: 'name', dataType: 'nvarchar(50)', nullable: true, key: undefined, default: "('x')", comment: undefined },
+      { name: 'amount', dataType: 'decimal(18, 2)', nullable: true, key: undefined, default: null, comment: undefined },
+    ]);
+    const sql = pool.requests[0]!.executed[0]!.sql;
+    expect(sql).toContain('sys.columns');
+    expect(sql).toContain('sys.types');
+    expect(sql).toContain('MS_Description');
+    expect(pool.requests[0]!.executed[0]!.binds).toEqual([['p1', '[dbo].[users]']]);
+    expect(pool.requests[1]!.executed[0]!.sql).toContain('sys.indexes');
+    expect(pool.requests[1]!.executed[0]!.sql).toContain('is_primary_key');
+    await a.close();
+  });
+
+  it('describeTable：表不存在抛「表不存在: <名>」', async () => {
+    const { a, pool } = await make();
+    pool.queue = [rec([], cols('column_name'))];
+    await expect(a.describeTable('ghost')).rejects.toThrow(/表不存在: dbo\.ghost/);
+    await a.close();
+  });
+
+  it('元数据 SQL 只用 2005+ 通用写法（禁用 STRING_AGG/TRIM/CONCAT_WS/STRING_SPLIT）', async () => {
+    const { a, pool } = await make();
+    pool.queue = [
+      rec([{ name: 'appdb' }], cols('name')),
+      rec([{ name: 'dbo' }], cols('name')),
+      rec([{ table_name: 't1', obj_type: 'U' }], cols('table_name', 'obj_type')),
+      rec([{ column_id: 1, column_name: 'id', type_name: 'int', max_length: 4, precision: 10, scale: 0, is_nullable: false, default_def: null, comment: null }], cols('column_id', 'column_name', 'type_name', 'max_length', 'precision', 'scale', 'is_nullable', 'default_def', 'comment')),
+      rec([{ column_id: 1 }], cols('column_id')),
+      rec([{ major: 15, version: '15.0.2000.5' }], cols('major', 'version')),
+      rec([{ id: 1 }], cols('id')),
+    ];
+    await a.listDatabases();
+    await a.listSchemas!();
+    await a.listTables();
+    await a.describeTable('t1');
+    await a.previewRows('t1', 1);
+    for (const req of pool.requests) {
+      for (const e of req.executed) {
+        expect(e.sql).not.toMatch(/STRING_AGG|CONCAT_WS|STRING_SPLIT|\bTRIM\s*\(/i);
+      }
+    }
+    await a.close();
+  });
+});
+
+/* ---------------- 错误人性化 ---------------- */
+
+function mssqlErr(name: string, code: string, extra?: Record<string, unknown>): Error {
+  const e = new Error(`mock ${code}`);
+  e.name = name;
+  Object.assign(e, { code }, extra);
+  return e;
+}
+
+describe('sqlserver 错误中文映射（手法 B）', () => {
+  const CASES: Array<[string, Error, RegExp]> = [
+    ['ELOGIN', mssqlErr('ConnectionError', 'ELOGIN'), /登录失败/],
+    ['ETIMEOUT(ConnectionError)', mssqlErr('ConnectionError', 'ETIMEOUT'), /连接超时/],
+    ['ETIMEOUT(RequestError)', mssqlErr('RequestError', 'ETIMEOUT'), /请求超时/],
+    ['ESOCKET', mssqlErr('ConnectionError', 'ESOCKET'), /网络不可达/],
+    ['EINSTLOOKUP', mssqlErr('ConnectionError', 'EINSTLOOKUP'), /SQL Server Browser|实例名|1434/],
+    ['ENOTOPEN', mssqlErr('ConnectionError', 'ENOTOPEN'), /连接已关闭|未打开/],
+    ['ECONNCLOSED', mssqlErr('ConnectionError', 'ECONNCLOSED'), /连接已关闭/],
+    ['EREQUEST', mssqlErr('RequestError', 'EREQUEST', { number: 208, severity: 16, lineNumber: 3 }), /208/],
+    ['ECANCEL', mssqlErr('RequestError', 'ECANCEL'), /取消/],
+  ];
+  it.each(CASES)('%s → 中文提示', async (_label, err, re) => {
+    const { a, pool } = await make();
+    pool.failWith = err;
+    const got = await a.query('SELECT 1').then(
+      () => {
+        throw new Error('应抛错');
+      },
+      (e: unknown) => e,
+    );
+    const msg = msgOf(got);
+    expect(msg).toMatch(re);
+    expect(msg).toMatch(/sqlserver 查询失败/);
+    await a.close();
+  });
+
+  it('未知错误码：保留原始信息（不吞）', async () => {
+    const { a, pool } = await make();
+    pool.failWith = mssqlErr('RequestError', 'EWHATEVER', { number: 42 });
+    await expect(a.query('SELECT 1')).rejects.toThrow(/EWHATEVER/);
+    await a.close();
+  });
+
+  it('TLS/证书特征错误：说明 TCP 已连通（不是网络不可达）并追加信任证书指引', async () => {
+    const { a, pool } = await make();
+    pool.failWith = mssqlErr('ConnectionError', 'ESOCKET', { message: 'self signed certificate in certificate chain' });
+    const err = await a.query('SELECT 1').then(
+      () => {
+        throw new Error('应抛错');
+      },
+      (e: unknown) => e,
+    );
+    const msg = msgOf(err);
+    // 保留「网络不可达」字样（既有断言/用户检索习惯），但明确否定它（TCP 实际已连通，避免误查网络）
+    expect(msg).toMatch(/网络不可达/);
+    expect(msg).toMatch(/TCP 已连通/);
+    expect(msg).toMatch(/trustServerCertificate/);
+    expect(msg).toMatch(/2008/);
+    await a.close();
+  });
+
+  it('非 TLS 的连接失败不追加证书指引（避免噪音）', async () => {
+    const { a, pool } = await make();
+    pool.failWith = mssqlErr('ConnectionError', 'ESOCKET', {
+      message: 'Failed to connect to db1.example.com:1433 in 15000ms',
+    });
+    const err = await a.query('SELECT 1').then(
+      () => {
+        throw new Error('应抛错');
+      },
+      (e: unknown) => e,
+    );
+    expect(msgOf(err)).toMatch(/网络不可达/);
+    expect(msgOf(err)).not.toMatch(/TCP 已连通/);
+    expect(msgOf(err)).not.toMatch(/trustServerCertificate/);
+    await a.close();
+  });
+});
+
+/* ---------------- 池缓存 / close / tx ---------------- */
+
+describe('sqlserver 池与事务（手法 B）', () => {
+  it('close 幂等：连关两次不抛且每个池只关一次', async () => {
+    const { a, h, pool } = await make();
+    h.pools[0]!.queue = [rec([{ n: 1 }], cols('n'))];
+    await a.query('SELECT 1', [], 'otherdb');
+    await a.close();
+    await expect(a.close()).resolves.toBeUndefined();
+    expect(pool.closed).toBe(1);
+    expect(h.pools[1]!.closed).toBe(1);
+  });
+
+  it('跨库池按库名缓存复用，且复用主池当库名相同', async () => {
+    const { a, h, pool } = await make();
+    pool.queue = [rec([{ n: 1 }], cols('n')), rec([{ n: 2 }], cols('n')), rec([{ n: 3 }], cols('n'))];
+    await a.query('SELECT 1', [], 'otherdb');
+    await a.query('SELECT 2', [], 'otherdb');
+    await a.query('SELECT 3', [], 'appdb');
+    expect(h.pools).toHaveLength(2);
+    expect(h.pools[0]!.requests).toHaveLength(1);
+    expect(h.pools[1]!.requests).toHaveLength(2);
+    await a.close();
+  });
+
+  it('跨库池键大小写归一：MyDB/mydb/MYDB 复用同池，与主库同名（大小写不同）复用主池', async () => {
+    const { a, h, pool } = await make();
+    pool.queue = [
+      rec([{ n: 1 }], cols('n')),
+      rec([{ n: 2 }], cols('n')),
+      rec([{ n: 3 }], cols('n')),
+      rec([{ n: 4 }], cols('n')),
+    ];
+    await a.query('SELECT 1', [], 'MyDB');
+    await a.query('SELECT 2', [], 'mydb');
+    await a.query('SELECT 3', [], 'MYDB');
+    // 连接默认库是 appdb：大小写不同不该另建池
+    await a.query('SELECT 4', [], 'AppDB');
+    expect(h.pools).toHaveLength(2); // 主池 + 一个跨库池
+    expect(h.pools[1]!.requests).toHaveLength(3);
+    expect(h.pools[0]!.requests).toHaveLength(1);
+    await a.close();
+  });
+
+  it('惰性建连：仅创建适配器不发请求（multi-instance 契约前提）', async () => {
+    const { a, pool } = await make();
+    expect(pool.connectCalls).toBe(0);
+    expect(pool.requests).toHaveLength(0);
+    await a.close();
+  });
+
+  it('tx：begin/commit/rollback 三方法，事务期间 query 走事务请求', async () => {
+    const { a, h, pool } = await make();
+    pool.queue = [rec([{ n: 1 }], cols('n')), rec([{ n: 2 }], cols('n'))];
+    const tx = a.tx as { begin(): Promise<void>; commit(): Promise<void>; rollback(): Promise<void> };
+    await tx.begin();
+    expect(h.txs).toHaveLength(1);
+    const t = h.txs[0]!;
+    await a.query('SELECT ?', [1]);
+    await a.execute('UPDATE t SET x = ?', [2]);
+    expect(t.requests).toHaveLength(2);
+    expect(pool.requests).toHaveLength(0);
+    await tx.commit();
+    expect(t.events).toEqual(['begin', 'commit']);
+    await expect(tx.commit()).rejects.toThrow(/没有进行中的事务/);
+    await a.close();
+  });
+
+  it('tx：重复 begin 报错，rollback 后事务结束', async () => {
+    const { a, h } = await make();
+    const tx = a.tx as { begin(): Promise<void>; commit(): Promise<void>; rollback(): Promise<void> };
+    await tx.begin();
+    await expect(tx.begin()).rejects.toThrow(/事务已开启/);
+    await tx.rollback();
+    expect(h.txs[0]!.events).toEqual(['begin', 'rollback']);
+    expect(h.txs[0]!.requests).toHaveLength(0);
+    await a.close();
+  });
+
+  it('tx：未 begin 时 commit/rollback 报中文错误', async () => {
+    const { a } = await make();
+    const tx = a.tx as { begin(): Promise<void>; commit(): Promise<void>; rollback(): Promise<void> };
+    await expect(tx.commit()).rejects.toThrow(/没有进行中的事务/);
+    await expect(tx.rollback()).rejects.toThrow(/没有进行中的事务/);
+    await a.close();
+  });
+
+  it('close 后再用：抛「连接已关闭」中文错误，且不新建跨库池（不泄漏）', async () => {
+    const { a, h } = await make();
+    await a.close();
+    await expect(a.query('SELECT 1')).rejects.toThrow(/已关闭/);
+    await expect(a.execute('UPDATE t SET x = 1')).rejects.toThrow(/已关闭/);
+    await expect(a.query('SELECT 1', [], 'otherdb')).rejects.toThrow(/已关闭/);
+    await expect(a.listTables()).rejects.toThrow(/已关闭/);
+    await expect(a.previewRows('users', 1)).rejects.toThrow(/已关闭/);
+    expect(h.pools).toHaveLength(1); // 关闭后未新建跨库池
+    await expect(a.close()).resolves.toBeUndefined();
+  });
+});
+
+/* ---------------- factory 导出 ---------------- */
+
+describe('sqlserver factory 导出', () => {
+  it('factory(conn) 走生产 vendor 路径可创建适配器且不建连（惰性）', async () => {
+    // 生产 AdapterFactory 无 driver 参数：此处真实 require vendor/sqlserver-driver.cjs，
+    // 验证「包可加载 + 建池惰性（不触网）」——vendor 缺失时本用例会以中文修复指引失败。
+    const mod = await import('../../lib/adapters/sqlserver/index.js');
+    const a: DatabaseAdapter = await mod.factory(connByUrl(BASE_URL));
+    expect(a.kind).toBe('sqlserver');
+    await a.close();
+    await expect(a.close()).resolves.toBeUndefined();
+  });
+});

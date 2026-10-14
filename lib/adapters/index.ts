@@ -27,6 +27,7 @@ const LOADERS: Record<DbKind, Loader> = {
   mongodb: () => import('./mongodb/index.js').then((m) => m.createMongoAdapter),
   oracle: () => import('./oracle/index.js').then((m) => m.createOracleAdapter),
   dmdb: () => import('./dmdb/index.js').then((m) => m.createDmAdapter),
+  sqlserver: () => import('./sqlserver/index.js').then((m) => m.createSqlserverAdapter),
 };
 
 /** 驱动缺失时的安装指引 */
@@ -39,6 +40,7 @@ const INSTALL_HINTS: Record<DbKind, string> = {
   mongodb: 'npm run build:mongodb（构建 vendor/mongodb-driver.cjs；发布包已内置产物，仅在缺失时需要）',
   oracle: 'npm install oracledb',
   dmdb: 'npm install dmdb',
+  sqlserver: 'npm run build:sqlserver（重建 vendor/sqlserver-driver.cjs；mssql 仅在 devDependencies）',
 };
 
 /** 生成带安装指引的驱动缺失错误 */

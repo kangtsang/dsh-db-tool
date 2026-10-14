@@ -50,7 +50,8 @@ export function normalizeCell(v: unknown): NormalizedCell {
       ? Number(b)
       : b.toString();
   }
-  if (v instanceof Date) return v.toISOString();
+  // Invalid Date（如驱动返回无法解析的日期）不能抛 RangeError：单格异常会放大成整查询失败
+  if (v instanceof Date) return Number.isNaN(v.getTime()) ? String(v) : v.toISOString();
   if (v instanceof Uint8Array) return `[BLOB ${v.byteLength} bytes]`;
   let s: string;
   try {

@@ -46,7 +46,7 @@ import { EditorView, drawSelection, keymap } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
 import { autocompletion } from '@codemirror/autocomplete';
-import { MySQL, PLSQL, PostgreSQL, SQLite, sql } from '@codemirror/lang-sql';
+import { MySQL, MSSQL, PLSQL, PostgreSQL, SQLite, sql } from '@codemirror/lang-sql';
 import { tags } from '@lezer/highlight';
 import {
   formatDialect,
@@ -54,9 +54,10 @@ import {
   plsql as fmtPlsql,
   postgresql as fmtPostgresql,
   sqlite as fmtSqlite,
+  transactsql as fmtTransactsql,
 } from 'sql-formatter';
 
-// kind → lang-sql 内置方言（官方清单）。gaussdb 按 PG 方言、oracle/dmdb 按 PL/SQL。
+// kind → lang-sql 内置方言（官方清单）。gaussdb 按 PG 方言、oracle/dmdb 按 PL/SQL、sqlserver 按 T-SQL。
 const SQL_DIALECTS = {
   mysql: MySQL,
   postgresql: PostgreSQL,
@@ -64,6 +65,7 @@ const SQL_DIALECTS = {
   sqlite: SQLite,
   oracle: PLSQL,
   dmdb: PLSQL,
+  sqlserver: MSSQL,
 };
 
 // kind → sql-formatter 方言对象。mongodb/redis 无 SQL 方言，format 原文返回。
@@ -74,6 +76,7 @@ const FMT_DIALECTS = {
   sqlite: fmtSqlite,
   oracle: fmtPlsql,
   dmdb: fmtPlsql,
+  sqlserver: fmtTransactsql,
 };
 
 // redis 常见命令表（大写原样补全）

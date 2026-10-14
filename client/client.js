@@ -468,7 +468,7 @@ window.__ModuleLoader__.load({
 
 		const TAB_ID = "dsh-db-tool";
 		const API = "/dsh-db-tool/api";
-		const DB_KINDS = ["mysql", "postgresql", "gaussdb", "sqlite", "redis", "mongodb", "oracle", "dmdb"];
+		const DB_KINDS = ["mysql", "postgresql", "gaussdb", "sqlite", "redis", "mongodb", "oracle", "dmdb", "sqlserver"];
 		const PAGE_SIZE = 50; // 契约：preview limit≤50 服务端强制
 
 		// --- HTTP 封装：保留 code / challengeId 供确认通道使用 ---
@@ -876,9 +876,10 @@ window.__ModuleLoader__.load({
 		// 统一返回形状：{ ok:true, ops:[{statement, params?, database?}] }（多条顺序执行，如 redis 两步）
 		// 或 { ok:false, error:"<i18n key>" }（error 为 key 名，组件侧 t() 本地化；null 表示通用错误）
 
-		// 方言判定：q=问号占位符（mysql/sqlite）、dollar=$n（postgresql/gaussdb）、colon=:n（oracle/dmdb）
+		// 方言判定：q=问号占位符（mysql/sqlite/sqlserver，sqlserver 的 @pN 由适配器内部重写）、
+		// dollar=$n（postgresql/gaussdb）、colon=:n（oracle/dmdb）
 		function dialectOf(kind) {
-			if (kind === "mysql" || kind === "sqlite") return "q";
+			if (kind === "mysql" || kind === "sqlite" || kind === "sqlserver") return "q";
 			if (kind === "postgresql" || kind === "gaussdb") return "dollar";
 			if (kind === "oracle" || kind === "dmdb") return "colon";
 			if (kind === "redis") return "redis";
@@ -886,8 +887,10 @@ window.__ModuleLoader__.load({
 			return null;
 		}
 
-		// 标识符引用：mysql 用反引号（内部双写转义），其余统一双引号（内部双写转义）
+		// 标识符引用：mysql 用反引号（内部双写转义），sqlserver 用方括号（] 双写转义），
+		// 其余统一双引号（内部双写转义）
 		function quoteIdent(kind, name) {
+			if (kind === "sqlserver") return "[" + String(name).split("]").join("]]") + "]";
 			const q = kind === "mysql" ? "`" : "\"";
 			return q + String(name).split(q).join(q + q) + q;
 		}
@@ -920,7 +923,9 @@ window.__ModuleLoader__.load({
 				return { ok: false, error: "noPkHint" };
 			}
 			// 表全限定：pg/gauss 用 schema 前缀（库由 execute 的 database 参数路由，语句内不写库名）；
-			// mysql 带库名（adapter 无 database 路由）；oracle/dmdb 的 dbRef 即 OWNER；sqlite 仅表名
+			// mysql 表名同样带库名（execute 的 database 参数已按库路由，全限定在目标库上执行等价，双保险）；
+			// oracle/dmdb 的 dbRef 即 OWNER；sqlite 仅表名；
+			// sqlserver 有 schema 时写 [库].[schema].[表] 三段
 			// execute 的 database 参数只传库名（db.schema 形态取点前段），连接目标只能是库，schema 靠语句内全限定
 			let table;
 			if (kind === "postgresql" || kind === "gaussdb") {
@@ -929,6 +934,13 @@ window.__ModuleLoader__.load({
 					: quoteIdent(kind, tableName);
 			} else if (kind === "mysql" || kind === "oracle" || kind === "dmdb") {
 				table = quoteIdent(kind, dbRef) + "." + quoteIdent(kind, tableName);
+			} else if (kind === "sqlserver") {
+				// 无 schema 时只写表名：T-SQL 两段式是 schema.object（不是 database.object），
+				// 写 [库].[表] 会被解析成 schema=库名 → 报 208 对象不存在；库由 database 参数路由
+				// （适配器按库名切池），与 pg/gauss 分支同构。
+				table = schemaName
+					? quoteIdent(kind, String(dbRef).split(".")[0]) + "." + quoteIdent(kind, schemaName) + "." + quoteIdent(kind, tableName)
+					: quoteIdent(kind, tableName);
 			} else {
 				table = quoteIdent(kind, tableName);
 			}
@@ -1029,23 +1041,29 @@ window.__ModuleLoader__.load({
 			if (kind === "postgresql" || kind === "gaussdb") return "postgresql";
 			if (kind === "sqlite") return "sqlite";
 			if (kind === "oracle" || kind === "dmdb") return "plsql";
+			if (kind === "sqlserver") return "transactsql";
 			return null;
 		}
 
 		// SQL 文本 → 语句列表 [{ text, start }]：text 为原文切片（保留内部注释/空白），start 为语句
 		// 首字符偏移（跳过前导空白/注释，错误就地显示后定位光标用）。词法跳过与 lang-sql 方言 spec
-		// 一一对应：单/双引号字符串（反斜杠与双写转义，mysql 另含反引号标识符）、-- 行注释
-		// （slashComments）、/* */ 块注释、$$...$$ dollar-quoting（doubleDollarQuotedStrings，仅
+		// 一一对应：单/双引号字符串（双写转义；反斜杠转义是 MySQL 专有语义，其它 kind 按标准 SQL）、
+		// -- 行注释（slashComments）、/* */ 块注释、$$...$$ dollar-quoting（doubleDollarQuotedStrings，仅
 		// postgresql/gaussdb）、MySQL DELIMITER 自定义分隔符（客户端指令：仅语句缓冲为空时切换后续
 		// 分隔符，指令行不产生语句）、Oracle/达梦 BEGIN..END 块（块内分号不切分；CREATE
-		// PROCEDURE/FUNCTION 体的分号由该块覆盖）。空/纯注释语句被过滤；无尾分隔符的最后一条也返回。
+		// PROCEDURE/FUNCTION 体的分号由该块覆盖）、SQL Server [方括号] 标识符与 GO 批分隔符
+		// （GO 支持重复计数与行尾 -- 注释；GO n 按总数语义展开上一批）。
+		// 空/纯注释语句被过滤；无尾分隔符的最后一条也返回。
 		// ponytail: depth 计数不识别 CASE..END/LOOP/IF 等（块内混用可能提前切分）；需要时换完整 PL/SQL 词法
+		// GO n 的重复上限：GO 是客户端批分隔符，n 次展开会成倍放大执行请求数，钳制防手滑/恶意写出天量请求
+		const GO_REPEAT_MAX = 1000;
 		function splitSqlStatements(sql, kind) {
 			const src = String(sql == null ? "" : sql);
 			const out = [];
 			const isWord = (c) => /[A-Za-z0-9_$]/.test(c);
 			let sep = ";";
 			let i = 0, stmtStart = 0, contentStart = 0, hasContent = false, depth = 0; // depth: BEGIN..END 嵌套计数
+			let batchFrom = 0; // 当前批（GO 之间）在 out 中的起始下标，供 GO n 整批重复用
 			while (i < src.length) {
 				const c = src[i];
 				if (c === "-" && src[i + 1] === "-") { // -- 行注释至行尾
@@ -1058,14 +1076,31 @@ window.__ModuleLoader__.load({
 					i = Math.min(src.length, i + 2);
 					continue;
 				}
-				if (c === "'" || c === '"' || (kind === "mysql" && c === "`")) { // 引号串：反斜杠与双写转义
+				if (c === "'" || c === '"' || (kind === "mysql" && c === "`")) { // 引号串：双写转义；反斜杠转义仅 MySQL 语义
 					if (!hasContent) contentStart = i;
 					hasContent = true;
 					i++;
 					while (i < src.length) {
-						if (src[i] === "\\") { i += 2; continue; }
+						// 反斜杠转义是 MySQL 专有语义；其它 kind（pg/oracle/sqlite/sqlserver）按标准 SQL，
+						// \ 是普通字符（T-SQL 下 'C:\temp\' 正常闭合，否则会误吞后续语句）
+						if (kind === "mysql" && src[i] === "\\") { i += 2; continue; }
 						if (src[i] === c) {
 							if (src[i + 1] === c) { i += 2; continue; } // 双写转义
+							i++;
+							break;
+						}
+						i++;
+					}
+					continue;
+				}
+				// [方括号] 标识符（sqlserver）：内部 ; 不切分，]] 为转义（方括号内反斜杠无转义语义）
+				if (kind === "sqlserver" && c === "[") {
+					if (!hasContent) contentStart = i;
+					hasContent = true;
+					i++;
+					while (i < src.length) {
+						if (src[i] === "]") {
+							if (src[i + 1] === "]") { i += 2; continue; }
 							i++;
 							break;
 						}
@@ -1090,6 +1125,50 @@ window.__ModuleLoader__.load({
 					while (e < src.length && src[e] !== "\n" && src[e] !== "\r") e++;
 					while (j < e && (src[j] === " " || src[j] === "\t")) j++;
 					if (j < e) { sep = src.slice(j, e); stmtStart = e; i = e; continue; }
+				}
+				// GO 批分隔符（sqlserver）：独占一行——行首可缩进、行尾可跟空白与 -- 行注释，
+				// 可带重复计数（GO 3 = 上一批执行 3 次，总数语义，与 sqlcmd 一致）；大小写不敏感；
+				// GO 行本身不产生语句。计数超 GO_REPEAT_MAX 时截断（防天量请求）。
+				if (kind === "sqlserver" && depth === 0 && (i === 0 || src[i - 1] === "\n")) {
+					let j = i;
+					while (j < src.length && (src[j] === " " || src[j] === "\t")) j++;
+					if (src.slice(j, j + 2).toUpperCase() === "GO" && !isWord(src[j + 2] || " ")) {
+						let k = j + 2, count = 1;
+						while (k < src.length && (src[k] === " " || src[k] === "\t")) k++;
+						if (src[k] >= "0" && src[k] <= "9") { // 可选重复计数：GO 0 / GO 1 均等同 1 次
+							let n = 0;
+							while (k < src.length && src[k] >= "0" && src[k] <= "9") {
+								n = Math.min(n * 10 + (src.charCodeAt(k) - 48), GO_REPEAT_MAX);
+								k++;
+							}
+							count = Math.max(1, n);
+						}
+						while (k < src.length && (src[k] === " " || src[k] === "\t")) k++;
+						if (src[k] === "-" && src[k + 1] === "-") { // 行尾注释：GO -- 说明
+							while (k < src.length && src[k] !== "\n") k++;
+						}
+						if (k >= src.length || src[k] === "\n" || src[k] === "\r") { // 确认行尾：行内 GO 不算
+							if (hasContent) {
+								// 语句切到 GO 行首前一行的行尾换行之前（text 不带 GO 行前导换行）
+								let end = i;
+								if (end > stmtStart && src[end - 1] === "\n") end -= src[end - 2] === "\r" ? 2 : 1;
+								out.push({ text: src.slice(stmtStart, end), start: contentStart });
+							}
+							// 批重复：把刚切出的当前批再追加 count-1 遍（总数语义；复制对象，不共享引用）
+							if (count > 1 && out.length > batchFrom) {
+								const batch = out.slice(batchFrom);
+								for (let r = 1; r < count; r++) {
+									for (const s of batch) out.push({ text: s.text, start: s.start });
+								}
+							}
+							batchFrom = out.length; // 下一批从后续新语句开始
+							i = k;
+							stmtStart = k;
+							contentStart = k;
+							hasContent = false;
+							continue;
+						}
+					}
 				}
 				// BEGIN/END 词计数（oracle/dmdb）：块内分号不切分；END 不把 depth 减到负（顶层 CASE..END 不受影响）
 				if ((kind === "oracle" || kind === "dmdb") && (i === 0 || !isWord(src[i - 1]))) {
@@ -1172,6 +1251,7 @@ window.__ModuleLoader__.load({
 			mongodb: { host: "127.0.0.1", port: 27017, database: "test" },
 			oracle: { host: "127.0.0.1", port: 1521, user: "system" },
 			dmdb: { host: "127.0.0.1", port: 5236, user: "SYSDBA" },
+			sqlserver: { host: "127.0.0.1", port: 1433, user: "sa" },
 		};
 
 		/**
@@ -1732,8 +1812,8 @@ window.__ModuleLoader__.load({
 					if (!open["c:" + c.id]) toggleConn(c);
 				}
 			}, [conns, projectPath, autoExpand]); // eslint-disable-line
-			// PG/GaussDB 官方层级为 数据库 → 模式(schema) → 表：库节点下先列 schema 再列表
-			const HAS_SCHEMAS = { postgresql: true, gaussdb: true };
+			// PG/GaussDB/SQL Server 官方层级为 数据库 → 模式(schema) → 表：库节点下先列 schema 再列表
+			const HAS_SCHEMAS = { postgresql: true, gaussdb: true, sqlserver: true };
 			function toggleDb(c, d) {
 				if (!projectPath) return;
 				toggle("d:" + c.id + "/" + d, () => loadByKey("d:" + c.id + "/" + d));
@@ -2397,7 +2477,7 @@ window.__ModuleLoader__.load({
 			};
 		}
 
-		const CONSOLE_SQL_KINDS = { mysql: true, postgresql: true, gaussdb: true, sqlite: true, oracle: true, dmdb: true };
+		const CONSOLE_SQL_KINDS = { mysql: true, postgresql: true, gaussdb: true, sqlite: true, oracle: true, dmdb: true, sqlserver: true };
 
 		function ConsoleView(props) {
 			const { conns, grants, projectPath, askConfirm, onError } = props;
@@ -2408,6 +2488,9 @@ window.__ModuleLoader__.load({
 			// Navicat 式跨库操控：当前库下拉（""=连接默认库），查询/执行路由到所选库
 			const [dbList, setDbList] = React.useState([]);
 			const [db, setDb] = React.useState("");
+			// 列库失败/加载中必须就地可见（对齐 BrowseTree 错误行；此前静默吞错，下拉在失败时无声消失）
+			const [dbsErr, setDbsErr] = React.useState("");
+			const [dbsLoading, setDbsLoading] = React.useState(false);
 			// 多标签（内存态，不落盘）：tabs[{id,title,sql,result,history}]
 			const tabSeq = React.useRef(1);
 			const [tabs, setTabs] = React.useState(() => [{ id: "t1", title: t("queryTab", { n: 1 }), sql: "", result: null, history: [] }]);
@@ -2433,11 +2516,19 @@ window.__ModuleLoader__.load({
 			const activeTab = tabs[activeIdx] || tabs[0];
 			const activeTabId = activeTab ? activeTab.id : "";
 
-			// 跨库下拉（保留既有行为：换连接重置）
+			// 跨库下拉（保留既有行为：换连接重置）；列库失败可见+可重试（词条与 TransferView 复用）
+			function loadDbs() {
+				setDbsErr(""); // 发起即清：换连接/重试成功/重试失败三路径由此闭合
+				if (!connId || !projectPath) return;
+				setDbsLoading(true);
+				api("databases" + qs({ project: projectPath, connId })).then(
+					(l) => { setDbList(l || []); setDbsLoading(false); },
+					(e) => { setDbsErr(String(e && e.message ? e.message : e)); setDbsLoading(false); },
+				);
+			}
 			React.useEffect(() => {
 				setDbList([]); setDb("");
-				if (!connId || !projectPath) return;
-				api("databases" + qs({ project: projectPath, connId })).then((l) => setDbList(l || []), () => setDbList([]));
+				loadDbs();
 			}, [connId, projectPath]);
 
 			// vendor bundle 异步加载（失败降级 textarea，静默）
@@ -2716,9 +2807,13 @@ window.__ModuleLoader__.load({
 								const suffix = g && g.mode ? " · " + g.mode : "";
 								return React.createElement("option", { key: c.id, value: c.id }, (c.name || c.id) + " (" + c.kind + suffix + ")");
 							})),
+						dbsErr && connId ? React.createElement("span", { className: "dbt-err", role: "alert" },
+							t("trxLoadDbsFail") + "：" + dbsErr + " ",
+							React.createElement("button", { className: "dbt-btn", onClick: loadDbs }, t("retry"))) : null,
 						dbList.length > 1 ? React.createElement("select", { value: db, disabled: !!txToken, onChange: (e) => setDb(e.target.value) },
 							React.createElement("option", { value: "" }, t("defaultDb")),
 							dbList.map((d) => React.createElement("option", { key: d, value: d }, d))) : null,
+						dbsLoading ? React.createElement("span", { className: "dbt-muted" }, "…") : null,
 					),
 				),
 				// 多标签条（内存态）：标签 + 关闭 + 新建
@@ -2896,8 +2991,8 @@ window.__ModuleLoader__.load({
 			const srcConn = conns.find((c) => c.id === srcId);
 			const dstConn = conns.find((c) => c.id === dstId);
 			const dstGrant = (props.grants || []).find((x) => x.connId === dstId);
-			// PG/GaussDB 三层（库→模式→表），与 BrowsePane 同一张表；sqlite 无库层（连接默认上下文）
-			const HAS_SCHEMAS = { postgresql: true, gaussdb: true };
+			// PG/GaussDB/SQL Server 三层（库→模式→表），与 BrowsePane 同一张表；sqlite 无库层（连接默认上下文）
+			const HAS_SCHEMAS = { postgresql: true, gaussdb: true, sqlserver: true };
 			const NO_DB_LEVEL = { sqlite: true };
 
 			// 项目切换清层级缓存（对齐 BrowsePane：避免陈旧授权下的旧数据）

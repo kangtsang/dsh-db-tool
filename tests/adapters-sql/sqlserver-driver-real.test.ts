@@ -358,16 +358,16 @@ describe('5) 真实驱动接口契约（Fake 驱动掩盖的部分）', () => {
     expect(() => new mssql.Transaction(pool)).not.toThrow();
   });
 
-  it('端口类型/取值：适配器给的是 number，越界回退默认 1433（驱动对端口有严格校验）', async () => {
+  it('端口类型/取值：适配器给的是 number，越界端口 fail-closed 抛中文错误（驱动对端口有严格校验）', async () => {
     const cfg = await cfgOf(BASE);
     expect(typeof cfg['port']).toBe('number');
-    // 越界端口驱动会抛 RangeError，适配器必须在前面挡掉
+    // 越界端口驱动会抛 RangeError，适配器必须在前面挡掉（官方 fail-closed 语义：非法值报错而非静默回退）
     expect(() => realDriverParse({ server: 'h', port: 65536, options: {} })).toThrow(/must be > 0 and < 65536/);
     const kit = captureDriver();
-    await createSqlserverAdapter(connByFields({ host: 'h', port: 70000 }), { driver: kit.driver });
-    const fallback = kit.cfgs[0]!;
-    expect(fallback['port']).toBe(1433);
-    expect(() => realDriverParse(fallback)).not.toThrow();
+    await expect(
+      createSqlserverAdapter(connByFields({ host: 'h', port: 70000 }), { driver: kit.driver }),
+    ).rejects.toThrow(/端口取值非法/);
+    expect(kit.cfgs).toHaveLength(0); // 校验先于建池，不产生驱动配置
   });
 
   it('tdsVersion 白名单与真实 tedious versions 表的差异（现状记录）', async () => {

@@ -105,6 +105,22 @@ describe('createPgLikeAdapter（mock 驱动）', () => {
     expect(full.configs[0]).toMatchObject({ port: 9000, user: 'ops' });
   });
 
+  it('fields 端口非法值抛中文错误（含原值与 1-65535，不再被驱动 truthy 检查静默回退默认）', async () => {
+    for (const port of ['abc', 0, -1, 99999, 1433.5]) {
+      await expect(make('postgresql', { host: 'h', database: 'd', port })).rejects.toThrow(
+        `postgresql 连接的端口取值非法：${JSON.stringify(port)}`,
+      );
+    }
+    await expect(make('gaussdb', { host: 'h', database: 'd', port: 'abc' })).rejects.toThrow(
+      'gaussdb 连接的端口取值非法："abc"',
+    );
+  });
+
+  it("fields 合法字符串端口 '14330' → 14330（前端原样发字符串，不得回退默认）", async () => {
+    const g = await make('gaussdb', { host: 'h', database: 'd', port: '14330' });
+    expect(g.configs[0]).toMatchObject({ port: 14330 });
+  });
+
   it('query 规范化 + 参数透传', async () => {
     const { a, pool } = await make('postgresql');
     pool.queue = [

@@ -121,7 +121,7 @@ beforeAll(() => {
 	// 只读注入：把 factory 作用域内的连接表单常量暴露给测试求值（不改仓库源码）
 	const marker = 'exports.__testables = {';
 	if (!src.includes(marker)) throw new Error('client.js 结构变更：未找到 __testables 导出点');
-	const patched = src.replace(marker, 'exports.__probe = { DB_KINDS, KIND_DEFAULTS, t };\n\t\t' + marker);
+	const patched = src.replace(marker, 'exports.__probe = { DB_KINDS, KIND_DEFAULTS, t, urlToFieldsPatch };\n\t\t' + marker);
 	new Function('window', 'console', 'fetch', patched)(fakeWindow, console, stubFetch);
 	const mod = fakeWindow.__DEF__.factory((name: string) => {
 		if (name === 'react') return reactStub.React;
@@ -142,8 +142,26 @@ describe('1 连接表单接线', () => {
 		expect(probe.DB_KINDS).toEqual(['mysql', 'postgresql', 'gaussdb', 'sqlite', 'redis', 'mongodb', 'oracle', 'dmdb', 'sqlserver']);
 	});
 
-	it('KIND_DEFAULTS.sqlserver = 127.0.0.1 / 1433 / sa（分字段模式默认值，client.js:1228）', () => {
-		expect(probe.KIND_DEFAULTS.sqlserver).toEqual({ host: '127.0.0.1', port: 1433, user: 'sa' });
+	it('KIND_DEFAULTS.sqlserver = 127.0.0.1 / sa，端口不预填（官方 port 可选默认 1433，命名实例场景端口互斥）', () => {
+		expect(probe.KIND_DEFAULTS.sqlserver).toEqual({ host: '127.0.0.1', user: 'sa' });
+	});
+
+	it('urlToFieldsPatch：从 URL（含脱敏 safeUrl）反解 host/port/user/database，URL 切分字段不再丢真实端口', () => {
+		// safeUrl 形态：redactUrl 只脱敏密码段，用户名/主机/端口是真实值（connections.ts:87-88）
+		expect(probe.urlToFieldsPatch('sqlserver://sa:***@db1.example.com:14330/appdb')).toEqual({
+			host: 'db1.example.com', port: '14330', user: 'sa', database: 'appdb',
+		});
+		// URL 编码的 userinfo/pathname 反解为原文
+		expect(probe.urlToFieldsPatch('sqlserver://u%40x:p%40ss@h1/db%2Fname')).toEqual({
+			host: 'h1', port: '', user: 'u@x', database: 'db/name',
+		});
+		// 无端口/无 userinfo/database：对应字段为空串，reenterFields 对空字段不填、走默认值
+		expect(probe.urlToFieldsPatch('sqlserver://db9.example.com')).toEqual({
+			host: 'db9.example.com', port: '', user: '', database: '',
+		});
+		// 非法/空 URL 返回 null，reenterFields 原样走官方默认值
+		expect(probe.urlToFieldsPatch('not a url')).toBeNull();
+		expect(probe.urlToFieldsPatch('')).toBeNull();
 	});
 });
 

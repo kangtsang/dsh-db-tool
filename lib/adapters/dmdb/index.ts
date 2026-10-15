@@ -20,6 +20,7 @@
  */
 import db from 'dmdb';
 import { sqlHead, SQL_READ_HEADS } from '../../guard/index.js';
+import { validPort } from '../sql-shared/common.js';
 import type {
   AccessMode,
   AdapterFactory,
@@ -84,6 +85,9 @@ export function resolveDmConn(conn: ResolvedConnection): { connectString: string
       throw new Error('DM URL 应以 dm:// 开头，如 dm://user:pass@host:5236');
     }
     const u = new URL(conn.url);
+    // 端口段校验：'dm://host:0' 等非法值抛中文错误，不再透传驱动报晦涩的 EADDRNOTAVAIL
+    // （connectString 仍用原 URL 原样透传，不重组）
+    if (u.port) validPort(u.port, 5236, 'dmdb');
     return {
       connectString: conn.url,
       user: decodeURIComponent(u.username),
@@ -92,7 +96,9 @@ export function resolveDmConn(conn: ResolvedConnection): { connectString: string
   }
   const f = conn.fields ?? {};
   const host = typeof f.host === 'string' ? f.host : '';
-  const port = typeof f.port === 'number' ? f.port : 5236;
+  // 前端原样发字符串端口：显式校验；历史 typeof==='number' 门把一切字符串（含合法 '14330'）
+  // 静默丢弃回退 5236，且驱动侧 parseInt 对非法形态还有第二重静默回退
+  const port = validPort(f.port, 5236, 'dmdb');
   if (host === '') {
     throw new Error('DM 连接需要 url（dm://user:pass@host:5236）或 fields（host/port）');
   }

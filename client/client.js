@@ -105,6 +105,7 @@ window.__ModuleLoader__.load({
 			urlUser: "用户名（可选，自动注入 URL）",
 			urlPassword: "密码（可选，自动注入 URL；留空保持已存）",
 			fieldsHost: "主机地址",
+			fieldsHostInstance: "主机地址（命名实例填 主机\\实例名，无需端口）",
 			fieldsPort: "端口",
 			fieldsUser: "用户名",
 			fieldsPassword: "密码",
@@ -323,6 +324,7 @@ window.__ModuleLoader__.load({
 			urlUser: "Username (optional, injected into URL)",
 			urlPassword: "Password (optional, injected into URL; blank keeps saved)",
 			fieldsHost: "Host",
+			fieldsHostInstance: "Host (named instance: host\\instance, no port needed)",
 			fieldsPort: "Port",
 			fieldsUser: "User",
 			fieldsPassword: "Password",
@@ -1251,7 +1253,7 @@ window.__ModuleLoader__.load({
 			mongodb: { host: "127.0.0.1", port: 27017, database: "test" },
 			oracle: { host: "127.0.0.1", port: 1521, user: "system" },
 			dmdb: { host: "127.0.0.1", port: 5236, user: "SYSDBA" },
-			sqlserver: { host: "127.0.0.1", port: 1433, user: "sa" },
+			sqlserver: { host: "127.0.0.1", user: "sa" },
 		};
 
 		/**
@@ -1266,6 +1268,24 @@ window.__ModuleLoader__.load({
 				next[k] = def[k] !== undefined ? String(def[k]) : "";
 			}
 			return next;
+		}
+
+		/** URL→分字段的字段反解：只取可信部分。safeUrl 仅脱敏密码段（用户名/主机/端口为真值），
+		 *  密码不可反解——留空走编辑语义，clearUrl 时由服务端迁移 URL 内嵌密码。非法 URL 返回 null。 */
+		function urlToFieldsPatch(url) {
+			if (!url) return null;
+			try {
+				const u = new URL(url);
+				const decoded = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
+				return {
+					host: u.hostname,
+					port: u.port,
+					user: decoded(u.username),
+					database: decoded(u.pathname.replace(/^\//, "")),
+				};
+			} catch {
+				return null;
+			}
 		}
 
 		/** 新建表单初始态：分字段模式 + 当前 kind 的官方默认值 */
@@ -1322,12 +1342,20 @@ window.__ModuleLoader__.load({
 				setDirty(new Set());
 				setDraftTest(null);
 			}
-			/** 从 URL 模式切回分字段：保留表单里已有值（编辑回填场景），只对空字段补官方默认值 */
+			/** 从 URL 模式切回分字段：表单已有值保留；空字段先从已填 URL 反解真实值，仍空的才补官方默认值——
+			 *  直接补默认会把 URL 里的真实主机/端口悄悄换成 127.0.0.1/1433（丢端口 bug）。 */
 			function reenterFields() {
 				setForm((prev) => {
 					const keep = new Set(dirty);
 					for (const k of ["host", "port", "user", "database"]) if (prev[k]) keep.add(k);
-					return withKindDefaults(Object.assign({}, prev, { mode: "fields" }), keep);
+					const next = Object.assign({}, prev, { mode: "fields" });
+					const fromUrl = urlToFieldsPatch(prev.url);
+					if (fromUrl) {
+						for (const k of ["host", "port", "user", "database"]) {
+							if (!prev[k] && fromUrl[k]) { next[k] = fromUrl[k]; keep.add(k); }
+						}
+					}
+					return withKindDefaults(next, keep);
 				});
 				setDraftTest(null);
 			}
@@ -1348,7 +1376,8 @@ window.__ModuleLoader__.load({
 					if (up) body.urlPassword = up;
 				} else {
 					body.fields = { host: form.host, user: form.user, database: form.database || undefined };
-					if (form.port) body.fields.port = Number(form.port);
+					// 端口原样发字符串：Number("abc")=NaN 会被 JSON 序列化成 null，服务端按「未提供端口」静默回退默认值，配置错误被掩盖
+					if (form.port) body.fields.port = form.port;
 					if (form.password) body.fields.password = form.password;
 					// 从 url 方式切到分字段保存 → 服务端清除已存 url（否则连接仍走旧 url）
 					if (props.initial && props.initial.mode === "url") body.clearUrl = true;
@@ -1406,7 +1435,8 @@ window.__ModuleLoader__.load({
 						"div",
 						{ style: { display: "flex", flexDirection: "column", gap: 6 } },
 						React.createElement("div", { className: "dbt-row" },
-							React.createElement("input", { placeholder: t("fieldsHost"), "aria-label": t("fieldsHost") + t("requiredMark"), "aria-required": "true", ref: firstInputRef, value: form.host, onChange: (e) => patch({ host: e.target.value }) }),
+							// sqlserver：官方模型 port 可选（默认 1433）且与命名实例互斥——host 直接填 主机\实例名，端口留空
+							React.createElement("input", { placeholder: form.kind === "sqlserver" ? t("fieldsHostInstance") : t("fieldsHost"), "aria-label": t("fieldsHost") + t("requiredMark"), "aria-required": "true", ref: firstInputRef, value: form.host, onChange: (e) => patch({ host: e.target.value }) }),
 							React.createElement("input", { placeholder: t("fieldsPort"), "aria-label": t("fieldsPort"), value: form.port, onChange: (e) => patch({ port: e.target.value }) }),
 							React.createElement("input", { placeholder: t("fieldsDatabase"), "aria-label": t("fieldsDatabase"), value: form.database, onChange: (e) => patch({ database: e.target.value }) })),
 						React.createElement("div", { className: "dbt-row" },
@@ -3685,6 +3715,7 @@ window.__ModuleLoader__.load({
 			sortRows, slicePage, ResultSetGrid,
 			classifyHead, ConsoleView,
 			Panel, TransferView, TransferLogView,
+			urlToFieldsPatch,
 		};
 		return module.exports;
 	},

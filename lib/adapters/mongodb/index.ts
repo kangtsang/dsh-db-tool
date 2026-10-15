@@ -17,6 +17,7 @@
  *    bson 保持 dependencies（bundle 的 external），保证 BSON 类实例与外部一致。
  */
 import { createRequire } from 'node:module';
+import { validPort } from '../sql-shared/common.js';
 import type {
   Binary,
   Decimal128,
@@ -607,7 +608,9 @@ export function reviveEjson(v: unknown): unknown {
 
 export function buildUri(fields: Record<string, unknown> | undefined, ssl?: boolean): string {
   const host = typeof fields?.host === 'string' && fields.host !== '' ? fields.host : '127.0.0.1';
-  const port = typeof fields?.port === 'number' ? fields.port : 27017;
+  // 前端原样发字符串端口：显式校验；历史 typeof==='number' 门把一切字符串（含合法 '14330'）
+  // 静默丢弃回退 27017，分字段模式用户所填端口实际永不生效
+  const port = validPort(fields?.port, 27017, 'mongodb');
   const user = typeof fields?.user === 'string' ? encodeURIComponent(fields.user) : '';
   const pass = typeof fields?.password === 'string' ? `:${encodeURIComponent(fields.password)}` : '';
   const auth = user !== '' ? `${user}${pass}@` : '';

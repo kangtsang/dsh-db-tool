@@ -152,9 +152,18 @@ function decodeCred(raw: string): string {
   }
 }
 
+/**
+ * 端口校验（fail-closed，对齐官方语义）：仅「未提供」回退默认端口（tedious 对未提供 port
+ * 默认 1433）；提供了但不是 1-65535 的整数则抛中文错误——与 tedious 对非法 port 抛
+ * RangeError 的行为一致，绝不静默改写用户配置（排障会被假端口误导）。
+ */
 function validPort(v: unknown, dflt: number): number {
+  if (v === undefined || v === null || v === '') return dflt;
   const n = Number(v);
-  return Number.isFinite(n) && n > 0 && n <= 65535 ? Math.floor(n) : dflt;
+  if (!Number.isInteger(n) || n <= 0 || n > 65535) {
+    throw new Error(`sqlserver 连接的端口取值非法：${JSON.stringify(v)}（须为 1-65535 的整数；留空才使用默认端口 ${dflt}）`);
+  }
+  return n;
 }
 
 /**
@@ -190,7 +199,7 @@ function poolConfig(conn: ResolvedConnection): Record<string, unknown> {
     } catch {
       // 脱敏：错误消息会进 audit.jsonl 与模型上下文，绝不回显 userinfo 明文密码
       throw new Error(
-        `sqlserver 连接 URL 无法解析：${redactUrl(conn.url)}（期望形态 sqlserver://user:pass@host:1433/db?encrypt=true；请检查端口是否在 1-65535、是否有多余字符）`,
+        `sqlserver 连接 URL 无法解析：${redactUrl(conn.url)}（期望形态 sqlserver://user:pass@host:1433/db?encrypt=true；请检查端口是否在 1-65535、是否有多余字符；命名实例请改用 ?instanceName=实例名 参数）`,
       );
     }
     if (!u.hostname) throw new Error('sqlserver 连接 URL 缺少主机名（期望形态 sqlserver://user:pass@host:1433/db）');
@@ -212,7 +221,8 @@ function poolConfig(conn: ResolvedConnection): Record<string, unknown> {
       options.tdsVersion = tds;
     }
     const instance = queryParam(u.searchParams, 'instanceName');
-    // 指定命名实例时 tedious 会忽略 port，改由 SQL Server Browser（UDP 1434）解析
+    // instanceName 与 port 互斥：mssql 层在建连前会 delete 掉 port（tedious 对两者共存直接抛
+    // 互斥 Error），端口改由 SQL Server Browser（UDP 1434）按实例名解析
     if (instance !== undefined && instance !== '') options.instanceName = instance;
     // fields.database 覆盖 URL 库名：传输端跨库定位（sqlserverLocate）按 pg/mysql 惯例、
     // 用浅拷贝在 fields 上写 database 而不改写 URL——此处让该覆盖生效，避免静默连回原库。
@@ -498,7 +508,7 @@ function mssqlReason(e: unknown): string {
       base = `服务器要求加密连接：当前 encrypt=false 被服务器拒绝，请改用 ?encrypt=true 后重试（${detail}）`;
       break;
     case 'EINSTLOOKUP':
-      base = `实例名解析失败：SQL Server Browser 服务可能未运行或 UDP 1434 不可达（命名实例可改用「主机:端口」直连，如 host,1433）（${detail}）`;
+      base = `实例名解析失败：SQL Server Browser 服务可能未运行或 UDP 1434 不可达（命名实例可改用「主机，端口」直连，如 host,1433）（${detail}）`;
       break;
     case 'ENOTOPEN':
     case 'ECONNCLOSED':
@@ -608,8 +618,10 @@ interface PoolBox {
 function makePoolBox(Driver: SqlDriver, cfg: Record<string, unknown>): PoolBox {
   const pool = new Driver.ConnectionPool(cfg);
   // 无条件兜底：mssql 的 ConnectionPool 在 acquire 失败（空闲连接被服务器断开等）时会
-  // emit('error', err)，EventEmitter 无监听器时直接抛 → 崩掉宿主进程。
-  pool.on('error', () => {});
+  // emit('error', err)，EventEmitter 无监听器时直接抛 → 崩掉宿主进程。这里只留痕不中断请求。
+  pool.on('error', (e: unknown) => {
+    console.error('[sqlserver] 连接池错误（不影响后续请求，连接将按需重建）:', e instanceof Error ? e.message : e);
+  });
 
   let connecting: Promise<void> | undefined;
   const ready = (): Promise<void> => {

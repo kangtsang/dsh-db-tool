@@ -14,7 +14,7 @@ import type {
   ResolvedConnection,
   TableInfo,
 } from '../types.js';
-import { assertIdent, clampLimit, clampOffset, humanize, normalizeCell, quoteIdent } from './common.js';
+import { assertIdent, clampLimit, clampOffset, humanize, normalizeCell, quoteIdent, validPort } from './common.js';
 
 /** 与 pg / gaussdb vendor 驱动结构兼容的最小接口 */
 export interface PgLikeResult {
@@ -91,7 +91,9 @@ function poolConfig(conn: ResolvedConnection, overrideUrl?: string, max = 10): R
     // devg-dist/gaussdb-12-0319）、默认管理用户 gaussdb；postgresql 维持社区默认 5432/postgres 不变。
     const gb = conn.meta.kind === 'gaussdb';
     base.host = String(f.host ?? '127.0.0.1');
-    base.port = Number(f.port ?? (gb ? 8000 : 5432));
+    // 前端原样发字符串端口：显式校验，NaN/'' 经 Number() 变 0 后会被驱动 truthy 检查
+    // 静默回退 defaults 5432（连 gaussdb 想兜底的 8000 都落不到）、小数被 parseInt 截断
+    base.port = validPort(f.port, gb ? 8000 : 5432, conn.meta.kind);
     base.user = String(f.user ?? f.username ?? (gb ? 'gaussdb' : 'postgres'));
     if (f.password != null) base.password = String(f.password);
     if (f.database != null) base.database = String(f.database);
@@ -110,7 +112,7 @@ function poolConfig(conn: ResolvedConnection, overrideUrl?: string, max = 10): R
  * authority（host:port,host:port）端口段含逗号非数字 → new URL 直接抛 Invalid URL。
  * 故自行按文本解析 authority，不经 WHATWG 解析。
  */
-export function normalizeUrl(url: string): NormalizedPgUrl {
+export function normalizeUrl(url: string, label = 'postgres'): NormalizedPgUrl {
   const stripped = url.replace(/^jdbc:/i, '');
   const schemeEnd = stripped.indexOf('://');
   // 无 authority（非 URL 形态）：整串原样保留，交由驱动按既有逻辑处理
@@ -126,8 +128,13 @@ export function normalizeUrl(url: string): NormalizedPgUrl {
     // ponytail: 按最后一个冒号拆 host/port，仅支持 IPv4/主机名（IPv6 需方括号感知，遇到再加）
     const ci = seg.lastIndexOf(':');
     if (ci < 0) return { host: seg };
-    const port = Number.parseInt(seg.slice(ci + 1), 10);
-    return Number.isFinite(port) ? { host: seg.slice(0, ci), port } : { host: seg };
+    const host = seg.slice(0, ci);
+    const rawPort = seg.slice(ci + 1);
+    // 空端口段视同未提供（驱动按默认端口探测）；非空则必须为 1-65535 整数——历史 parseInt
+    // 会静默截断 '1433.5'→1433、NaN 时把整段当主机名，均属静默改写端口。dflt 传 0 仅占位：
+    // rawPort 非空不会走到回退分支。
+    if (rawPort === '') return { host };
+    return { host, port: validPort(rawPort, 0, label) };
   });
   const prefix = `${stripped.slice(0, schemeEnd)}://${userinfo}`;
   // 单台不设 hosts（调用方只在多台时探测）
@@ -190,7 +197,7 @@ export async function pgLikePoolCfg(
   conn: ResolvedConnection,
   max: number,
 ): Promise<{ cfg: Record<string, unknown>; url?: string }> {
-  const norm = conn.url ? normalizeUrl(conn.url) : null;
+  const norm = conn.url ? normalizeUrl(conn.url, kind) : null;
   const cleanUrl = norm ? norm.prefix + (norm.hosts ?? []).map(joinHostSeg).join(',') + norm.suffix : undefined;
   let finalUrl: string | undefined = cleanUrl;
   if (norm?.hosts && norm.hosts.length > 1) {

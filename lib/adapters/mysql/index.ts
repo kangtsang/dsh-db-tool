@@ -22,7 +22,7 @@ import type {
   ResolvedConnection,
   TableInfo,
 } from '../types.js';
-import { assertIdent, clampLimit, clampOffset, humanize, normalizeCell, quoteIdent } from '../sql-shared/common.js';
+import { assertIdent, clampLimit, clampOffset, humanize, normalizeCell, quoteIdent, validPort } from '../sql-shared/common.js';
 import type { TxHandle } from '../sql-shared/pg-like.js';
 
 /** ro 模式下 query 允许的读语句首词白名单 */
@@ -63,7 +63,8 @@ function connOptions(conn: ResolvedConnection): mysql.PoolOptions {
   if (conn.url) {
     const u = new URL(conn.url);
     base.host = u.hostname;
-    base.port = Number(u.port) || 3306;
+    // 端口段校验：':0' 等非法值抛中文错误，不再被 Number()|| 静默改写 3306
+    base.port = u.port ? validPort(u.port, 3306, 'mysql') : 3306;
     try {
       if (u.username) base.user = decodeURIComponent(u.username);
       if (u.password) base.password = decodeURIComponent(u.password);
@@ -77,7 +78,8 @@ function connOptions(conn: ResolvedConnection): mysql.PoolOptions {
   } else if (conn.fields) {
     const f = conn.fields;
     base.host = String(f.host ?? '127.0.0.1');
-    base.port = Number(f.port ?? 3306);
+    // 前端原样发字符串端口：显式校验，NaN/0 等不再被驱动 `|| 3306` 静默改写后连错服务
+    base.port = validPort(f.port, 3306, 'mysql');
     base.user = String(f.user ?? f.username ?? 'root');
     if (f.password != null) base.password = String(f.password);
     if (f.database != null) base.database = String(f.database);

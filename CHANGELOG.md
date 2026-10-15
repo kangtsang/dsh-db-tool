@@ -1,5 +1,17 @@
 # Changelog — dsh-db-tool
 
+## 1.8.1
+
+SQL Server 连接官方文档对照修复 + 全库端口 fail-open 治理。
+
+### 修复
+
+- **SQL Server 端口三层修复**：分字段表单移除 1433 端口预填（官方 port 可选、默认 1433，且与命名实例互斥）；host 输入对 sqlserver 提示命名实例官方形态 `主机\实例名`；URL 切分字段时从 safeUrl 反解真实 host/port/user/database（`urlToFieldsPatch`，原先一律补默认值导致真实端口静默丢失）。
+- **端口校验 fail-closed（sqlserver）**：非法端口（越界/非数字）此前被 `validPort` 静默回退 1433，现抛中文错误含原值；前端端口改原样发字符串（此前 `Number(NaN)→JSON null` 会把非法值伪装成"未提供"架空校验）。
+- **update 写 URL 时对称清理残留 fields**（lib/store/connections.ts）：此前 fields→URL 方向保存不清旧 fields，叠加 sqlserver 等适配器的 `fields.database` 覆盖 URL 库名口径，出现"safeUrl 显示新库、实际连旧库"的静默错库。
+- **全库端口 fail-open 治理**：mysql / pg / gaussdb / redis / mongodb / oracle / dmdb 的端口处理均存在非法值静默回退默认端口（redis/mongodb/oracle/dmdb 的 `typeof port === 'number'` 门连合法字符串端口也吞掉——分字段模式下用户所填端口实际永不生效；mysql 的 NaN 被 mysql2 `|| 3306` 静默改写实连；pg 的 NaN/空串被驱动 truthy 检查回退 5432，gaussdb 兜底 8000 落不到）。统一修复为「未提供→官方默认；提供但非法→中文报错含原值」，各库补离线用例。sqlite 文件型无端口概念，实证无需修复。
+- **文案与可观测性（sqlserver）**：EINSTLOOKUP 提示的「主机：端口」（冒号非法）改为官方逗号形态 `host,1433`；URL 解析失败补「命名实例请改用 `?instanceName=`」出口；instanceName 与 port 共存行为注释修正（实为 mssql 层删 port）；连接池错误从静默吞掉改为 `console.error` 留痕。
+
 ## 1.8.0
 
 新增 SQL Server 数据库支持（适配器 + 传输 + 侧边栏方言接入）。

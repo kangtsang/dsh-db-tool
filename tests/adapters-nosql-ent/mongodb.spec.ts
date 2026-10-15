@@ -179,6 +179,16 @@ describe('buildUri（fields 模式）', () => {
   it('仅 authSource → 单参数', () => {
     expect(buildUri({ host: 'h', port: 27017, authDatabase: 'admin' })).toBe('mongodb://h:27017?authSource=admin');
   });
+  it('缺省端口 → 27017；合法字符串端口不回退（前端原样发字符串）', () => {
+    expect(buildUri({ host: 'h' })).toBe('mongodb://h:27017');
+    expect(buildUri(undefined)).toBe('mongodb://127.0.0.1:27017');
+    expect(buildUri({ host: 'h', port: '14330' })).toBe('mongodb://h:14330');
+  });
+  it('端口非法值抛中文错误（含原值与 1-65535，不再被 typeof 门静默丢弃回退 27017）', () => {
+    for (const port of ['abc', 0, -1, 99999, 1433.5]) {
+      expect(() => buildUri({ host: 'h', port })).toThrow(`mongodb 连接的端口取值非法：${JSON.stringify(port)}`);
+    }
+  });
 });
 
 describe('normalizeMongoCell', () => {

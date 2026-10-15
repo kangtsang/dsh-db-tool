@@ -138,6 +138,27 @@ describe('ConnectionStore', () => {
     expect(store.secrets.get('m2')?.password).toBeUndefined();
   });
 
+  it('update 提交 url（分字段切 URL 方式）→ 残留 fields 清除，safeUrl 为新 URL（clearUrl 的反方向对称）', () => {
+    store.connections.create({
+      id: 'a',
+      kind: 'sqlserver',
+      fields: { host: 'h1', port: 1433, user: 'sa', database: 'testdb', password: 'FIELDSECRET' },
+    });
+    const updated = store.connections.update('a', { url: 'sqlserver://sa:URLSECRET@h1:1433/otherdb' });
+    expect(updated).toMatchObject({ mode: 'url', safeUrl: 'sqlserver://sa:***@h1:1433/otherdb' });
+    expect(updated!.database).toBeUndefined(); // toMeta 不再从残留 fields 回填 testdb
+    // 落盘层面确认 fields 整体清除：残留 fields.database 会让 sqlserver 适配器幽灵覆盖 URL 库名（静默连错库）
+    expect(readStoreFile(home, 'connections.json')).not.toContain('testdb');
+    expect(store.secrets.get('a')?.url).toBe('sqlserver://sa:URLSECRET@h1:1433/otherdb');
+  });
+
+  it('update 不带 url（只改 name）→ fields 原样保留', () => {
+    store.connections.create({ id: 'b', kind: 'sqlserver', fields: { host: 'h1', port: 1433, database: 'testdb' } });
+    const updated = store.connections.update('b', { name: '改个名' });
+    expect(updated).toMatchObject({ mode: 'fields', name: '改个名', host: 'h1', port: 1433, database: 'testdb' });
+    expect(readStoreFile(home, 'connections.json')).toContain('testdb');
+  });
+
   it('testTarget 返回含机密的 ResolvedConnection；不存在抛错', () => {
     store.connections.create({
       id: 'a',

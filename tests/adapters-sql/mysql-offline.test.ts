@@ -115,3 +115,45 @@ describe("mysql promise 池 'connection' 回调：会话 SET 的错误兜底", (
     }
   });
 });
+
+describe('mysql 端口校验（fail-closed，sqlserver validPort 同口径）', () => {
+  // mysql2 promise 池无直接 config，经内部 callback 池反查（mysql2 3.24.4 实测可查）
+  const cfgPort = (raw: { pool: unknown }): number =>
+    (raw.pool as { pool: { config: { connectionConfig: { port: number } } } }).pool.config.connectionConfig.port;
+  const fieldsConn = (port: unknown): ResolvedConnection => ({
+    meta: { id: 'mysql-port', kind: 'mysql' },
+    fields: { host: '127.0.0.1', user: 'u', password: 'p', database: 'dbx', port },
+  });
+
+  it('fields 端口非法值抛中文错误（含原值与 1-65535）', async () => {
+    for (const port of ['abc', 0, -1, 99999, 1433.5]) {
+      await expect(createMysqlAdapter(fieldsConn(port))).rejects.toThrow(
+        `mysql 连接的端口取值非法：${JSON.stringify(port)}`,
+      );
+    }
+  });
+
+  it('fields 未提供端口 → 默认 3306', async () => {
+    const raw = await openMysqlRaw(fieldsConn(undefined));
+    try {
+      expect(cfgPort(raw)).toBe(3306);
+    } finally {
+      await raw.pool.end();
+    }
+  });
+
+  it("fields 合法字符串端口 '14330' → 14330（前端原样发字符串，不得回退）", async () => {
+    const raw = await openMysqlRaw(fieldsConn('14330'));
+    try {
+      expect(cfgPort(raw)).toBe(14330);
+    } finally {
+      await raw.pool.end();
+    }
+  });
+
+  it("URL 端口段 ':0' 抛中文错误（不再被 Number()|| 静默改写 3306）", async () => {
+    await expect(createMysqlAdapter(connByUrl('mysql://u:p@127.0.0.1:0/dbx'))).rejects.toThrow(
+      'mysql 连接的端口取值非法："0"',
+    );
+  });
+});

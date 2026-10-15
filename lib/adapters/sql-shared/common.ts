@@ -1,5 +1,5 @@
 /**
- * SQL 系适配器共享工具：单元格规范化、标识符校验/引用、limit 钳制、错误包装。
+ * 适配器共享工具：单元格规范化、标识符校验/引用、limit 钳制、端口校验、错误包装。
  */
 import type { NormalizedCell } from '../types.js';
 
@@ -35,6 +35,21 @@ export function clampLimit(limit: number, max = 50): number {
 export function clampOffset(offset?: number): number {
   const n = Math.floor(Number(offset ?? 0));
   return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * 端口校验（fail-closed，sqlserver validPort 同口径，各适配器 fields/URL 两路径共用）：
+ * 仅「未提供」（undefined/null/''，表单留空的官方语义）回退该库默认端口；提供了但
+ * Number() 后不是 1-65535 的整数则抛中文错误——绝不静默改写用户配置（各驱动普遍对
+ * falsy 端口 `|| 默认` 静默回退、对非整数静默截断，连错服务/端口后排障会被误导）。
+ */
+export function validPort(v: unknown, dflt: number, label: string): number {
+  if (v === undefined || v === null || v === '') return dflt;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n <= 0 || n > 65535) {
+    throw new Error(`${label} 连接的端口取值非法：${JSON.stringify(v)}（须为 1-65535 的整数；留空才使用默认端口 ${dflt}）`);
+  }
+  return n;
 }
 
 /** 任意单元格 → NormalizedCell（string | number | null） */

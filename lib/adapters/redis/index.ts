@@ -10,6 +10,7 @@
  *  - 只读账号建议由用户在服务端配置 ACL 只读用户（见 README/文档）。
  */
 import { createClient, type RedisClientType } from 'redis';
+import { validPort } from '../sql-shared/common.js';
 import type {
   AccessMode,
   AdapterFactory,
@@ -124,9 +125,11 @@ function parseInfo(raw: string): [string, NormalizedCell][] {
 }
 
 /** 从 fields 拼接连接 URL（url 缺省时） */
-function buildUrl(fields: Record<string, unknown> | undefined, ssl?: boolean): string {
+export function buildUrl(fields: Record<string, unknown> | undefined, ssl?: boolean): string {
   const host = typeof fields?.host === 'string' && fields.host !== '' ? fields.host : '127.0.0.1';
-  const port = typeof fields?.port === 'number' ? fields.port : 6379;
+  // 前端原样发字符串端口：显式校验；历史 typeof==='number' 门把一切字符串（含合法 '14330'）
+  // 静默丢弃回退 6379，属静默错连
+  const port = validPort(fields?.port, 6379, 'redis');
   const user = typeof fields?.user === 'string' && fields.user !== '' ? encodeURIComponent(fields.user) : '';
   const pass = typeof fields?.password === 'string' ? `:${encodeURIComponent(fields.password)}@` : '';
   const db = typeof fields?.database === 'number' && fields.database !== 0 ? `/${fields.database}` : '';

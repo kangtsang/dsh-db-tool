@@ -18,6 +18,7 @@
  */
 import oracledb from 'oracledb';
 import { sqlHead, SQL_READ_HEADS } from '../../guard/index.js';
+import { validPort } from '../sql-shared/common.js';
 import type {
   AccessMode,
   AdapterFactory,
@@ -129,12 +130,15 @@ export function resolveOracleConn(conn: ResolvedConnection): { user: string; pas
     return {
       user,
       password: decodeURIComponent(u.password),
-      connectString: `${u.hostname}:${u.port || 1521}/${service}`,
+      // 端口段校验：':0' 等非法值抛中文错误，不再 host:0 直传驱动
+      connectString: `${u.hostname}:${u.port ? validPort(u.port, 1521, 'oracle') : 1521}/${service}`,
     };
   }
   const f = conn.fields ?? {};
   const host = typeof f.host === 'string' ? f.host : '';
-  const port = typeof f.port === 'number' ? f.port : 1521;
+  // 前端原样发字符串端口：显式校验；历史 typeof==='number' 门把一切字符串（含合法 '14330'）
+  // 静默丢弃回退 1521
+  const port = validPort(f.port, 1521, 'oracle');
   const service = typeof f.service === 'string' ? f.service : typeof f.database === 'string' ? f.database : '';
   if (host === '' || service === '') {
     throw new Error('Oracle 连接需要 url（oracle://user:pass@host:1521/SERVICE）或 fields（host/port/service）');

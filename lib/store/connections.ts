@@ -312,6 +312,9 @@ export class ConnectionStore {
     if (finalUrl !== undefined) {
       rec.urlSafe = redactUrl(finalUrl);
       this.secrets.set(id, { url: finalUrl });
+      // 对称清理（clearUrl 的反方向）：切到 URL 方式保存即放弃分字段配置；残留 fields 会被
+      // sqlserver 等适配器的 fields.database 幽灵覆盖 URL 库名（safeUrl 显示新库、实际连旧库的静默错库）
+      delete rec.fields;
     }
     if (patch.clearUrl && rec.urlSafe !== undefined) {
       delete rec.urlSafe;

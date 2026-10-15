@@ -4,6 +4,7 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 import {
+  buildUrl,
   createRedisAdapter,
   DANGEROUS_COMMANDS,
   parseRedisCommand,
@@ -253,5 +254,25 @@ describe('元数据映射', () => {
     const r = await a.previewRows('h', 10);
     expect(r.columns).toEqual(['field', 'value']);
     expect(r.rowCount).toBe(2);
+  });
+});
+
+describe('buildUrl 端口校验（fail-closed，sqlserver validPort 同口径）', () => {
+  it('fields 未提供端口 → 默认 6379', () => {
+    expect(buildUrl({ host: 'h' })).toBe('redis://h:6379');
+    expect(buildUrl(undefined)).toBe('redis://127.0.0.1:6379');
+  });
+  it("fields 合法字符串端口 '14330' → 14330（前端原样发字符串，不得回退）", () => {
+    expect(buildUrl({ host: 'h', port: '14330' })).toBe('redis://h:14330');
+  });
+  it('fields 端口非法值抛中文错误（含原值与 1-65535）', () => {
+    for (const port of ['abc', 0, -1, 99999, 1433.5]) {
+      expect(() => buildUrl({ host: 'h', port })).toThrow(`redis 连接的端口取值非法：${JSON.stringify(port)}`);
+    }
+  });
+  it('接线：createRedisAdapter fields 非法端口在 connect 前抛中文错误（不触网）', async () => {
+    await expect(
+      createRedisAdapter({ meta: { id: 'redis-port', kind: 'redis' }, fields: { host: '127.0.0.1', port: 'abc' } }),
+    ).rejects.toThrow('redis 连接的端口取值非法："abc"');
   });
 });

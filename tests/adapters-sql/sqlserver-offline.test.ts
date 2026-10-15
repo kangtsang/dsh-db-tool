@@ -220,6 +220,35 @@ describe('sqlserver 配置校验（离线，手法 A）', () => {
     ).rejects.toThrow(/encrypt/);
   });
 
+  it('fields 端口非法（越界/非数字/小数）：抛中文错误且含原值，不静默回退 1433', async () => {
+    const h = harness();
+    for (const port of [99999, 'abc', 0, -1, 1433.5]) {
+      const err = await createSqlserverAdapter(connByFields({ host: 'h', user: 'u', password: 'p', port }), {
+        driver: h.driver,
+      }).then(
+        () => {
+          throw new Error(`应抛错：port=${JSON.stringify(port)}`);
+        },
+        (e: unknown) => e,
+      );
+      const msg = msgOf(err);
+      expect(msg, `port=${JSON.stringify(port)}`).toMatch(/端口取值非法/);
+      expect(msg).toMatch(/1-65535/);
+      // 错误里保留原值（fail-closed：用户配错的端口必须可见，不能被假端口掩盖）
+      expect(msg).toContain(JSON.stringify(port));
+      // 校验发生在建池之前：不该有任何池配置产出
+      expect(h.configs, `port=${JSON.stringify(port)}`).toHaveLength(0);
+    }
+  });
+
+  it('URL 端口 0：抛中文错误（>65535 由 WHATWG URL 解析直接拒绝，0 可通过解析但非法）', async () => {
+    const h = harness();
+    await expect(
+      createSqlserverAdapter(connByUrl('sqlserver://sa:pw@host:0/db'), { driver: h.driver }),
+    ).rejects.toThrow(/端口取值非法/);
+    expect(h.configs).toHaveLength(0);
+  });
+
   it('URL 解析失败：错误消息脱敏（不含明文密码），但仍可定位问题', async () => {
     const h = harness();
     const err = await createSqlserverAdapter(connByUrl('sqlserver://sa:S3cretPwd@host:99999/db'), {
@@ -237,6 +266,8 @@ describe('sqlserver 配置校验（离线，手法 A）', () => {
     expect(msg).toMatch(/\*\*\*@host/);
     expect(msg).toMatch(/sqlserver:\/\//);
     expect(msg).toMatch(/期望形态/);
+    // 命名实例（host\SQLEXPRESS）是 WHATWG URL 必然解析失败的合法场景：必须给出正确出口
+    expect(msg).toMatch(/\?instanceName=/);
   });
 });
 
@@ -290,6 +321,17 @@ describe('sqlserver URL / fields 解析（手法 B）', () => {
       driver: h.driver,
     });
     expect(h.configs[0]).toMatchObject({ server: 'h2', port: 1433, user: 'u', password: 'p', database: 'd' });
+    await a.close();
+  });
+
+  it('fields 模式：命名实例 host\\instance 原样进 server，端口省略不拦截（tedious 侧由 mssql 拆实例名并让 instanceName 赢）', async () => {
+    const h = harness();
+    const a = await createSqlserverAdapter(
+      connByFields({ host: 'localhost\\SQLEXPRESS', user: 'u', password: 'p', database: 'd' }),
+      { driver: h.driver },
+    );
+    expect(h.configs[0]).toMatchObject({ server: 'localhost\\SQLEXPRESS', port: 1433 });
+    expect((h.configs[0]!.options as Record<string, unknown>).instanceName).toBe(undefined);
     await a.close();
   });
 
@@ -999,7 +1041,7 @@ describe('sqlserver 错误中文映射（手法 B）', () => {
     ['ETIMEOUT(ConnectionError)', mssqlErr('ConnectionError', 'ETIMEOUT'), /连接超时/],
     ['ETIMEOUT(RequestError)', mssqlErr('RequestError', 'ETIMEOUT'), /请求超时/],
     ['ESOCKET', mssqlErr('ConnectionError', 'ESOCKET'), /网络不可达/],
-    ['EINSTLOOKUP', mssqlErr('ConnectionError', 'EINSTLOOKUP'), /SQL Server Browser|实例名|1434/],
+    ['EINSTLOOKUP', mssqlErr('ConnectionError', 'EINSTLOOKUP'), /「主机，端口」直连，如 host,1433/],
     ['ENOTOPEN', mssqlErr('ConnectionError', 'ENOTOPEN'), /连接已关闭|未打开/],
     ['ECONNCLOSED', mssqlErr('ConnectionError', 'ECONNCLOSED'), /连接已关闭/],
     ['EREQUEST', mssqlErr('RequestError', 'EREQUEST', { number: 208, severity: 16, lineNumber: 3 }), /208/],

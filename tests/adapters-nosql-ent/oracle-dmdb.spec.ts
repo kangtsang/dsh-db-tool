@@ -7,6 +7,7 @@ import oracledb from 'oracledb';
 import {
   createDmAdapter,
   humanizeDmError,
+  resolveDmConn,
   sanitizeIdentifier as sanitizeDmIdent,
 } from '../../lib/adapters/dmdb/index.js';
 import {
@@ -365,5 +366,48 @@ describe('达梦 DM（mock pool）', () => {
     expect(sanitizeDmIdent('a-b', '表名')).toBe('a-b');
     expect(() => sanitizeDmIdent('', '表名')).toThrow('非法 DM');
     expect(() => sanitizeDmIdent('a\nb', '表名')).toThrow('非法 DM');
+  });
+});
+
+describe('Oracle / DM 端口校验（fail-closed，sqlserver validPort 同口径）', () => {
+  it('resolveOracleConn fields 端口非法值抛中文错误（含原值与 1-65535）', () => {
+    for (const port of ['abc', 0, -1, 99999, 1433.5]) {
+      expect(() =>
+        resolveOracleConn({ meta: { id: 'x', kind: 'oracle' }, fields: { host: 'h', service: 'svc', user: 'u', port } }),
+      ).toThrow(`oracle 连接的端口取值非法：${JSON.stringify(port)}`);
+    }
+  });
+  it('resolveOracleConn fields 缺省端口 → 1521；合法字符串端口不回退', () => {
+    expect(
+      resolveOracleConn({ meta: { id: 'x', kind: 'oracle' }, fields: { host: 'h', service: 'svc', user: 'u' } })
+        .connectString,
+    ).toBe('h:1521/svc');
+    expect(
+      resolveOracleConn({
+        meta: { id: 'x', kind: 'oracle' },
+        fields: { host: 'h', service: 'svc', user: 'u', port: '14330' },
+      }).connectString,
+    ).toBe('h:14330/svc');
+  });
+  it("resolveOracleConn URL 端口段 ':0' 抛中文错误（不再 host:0 直传驱动）", () => {
+    expect(() => resolveOracleConn({ meta: { id: 'x', kind: 'oracle' }, url: 'oracle://u:p@h:0/SVC' })).toThrow(
+      'oracle 连接的端口取值非法："0"',
+    );
+  });
+  it('resolveDmConn fields 端口非法值抛中文错误；缺省 → 5236；合法字符串端口不回退', () => {
+    for (const port of ['abc', 0, -1, 99999, 1433.5]) {
+      expect(() => resolveDmConn({ meta: { id: 'x', kind: 'dmdb' }, fields: { host: 'h', port } })).toThrow(
+        `dmdb 连接的端口取值非法：${JSON.stringify(port)}`,
+      );
+    }
+    expect(resolveDmConn({ meta: { id: 'x', kind: 'dmdb' }, fields: { host: 'h' } }).connectString).toContain(':5236');
+    expect(
+      resolveDmConn({ meta: { id: 'x', kind: 'dmdb' }, fields: { host: 'h', port: '14330' } }).connectString,
+    ).toContain(':14330');
+  });
+  it("resolveDmConn URL 端口段 ':0' 抛中文错误（不再透传驱动报晦涩 EADDRNOTAVAIL）", () => {
+    expect(() => resolveDmConn({ meta: { id: 'x', kind: 'dmdb' }, url: 'dm://u:p@h:0' })).toThrow(
+      'dmdb 连接的端口取值非法："0"',
+    );
   });
 });

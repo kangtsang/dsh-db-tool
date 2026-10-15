@@ -1087,6 +1087,35 @@ describe('sqlserver 错误中文映射（手法 B）', () => {
     await a.close();
   });
 
+  it('TLS 协议版本不符（真实案例）：老实例仅 TLS 1.0 对客户端最低 TLS 1.2 的握手失败，不再误报网络不可达', async () => {
+    // 2026-10-15 真机案例：tedious wrapSocketError 把 BoringSSL 原文原样拼进 ESOCKET message
+    // （connection.js:1457），底层错误同时挂在 ES cause 上而非 originalError（事务 abort 专用）
+    const { a, pool } = await make();
+    pool.failWith = mssqlErr(
+      'ConnectionError',
+      'ESOCKET',
+      {
+        message:
+          'Failed to connect to 10.192.68.42:1433 - 107904error:100000f0:SSL routines:OPENSSL_internal:UNSUPPORTED_PROTOCOL:..\\..\\third_party\\boringssl\\src\\ssl\\handshake_client.c',
+        cause: new Error(
+          '107904error:100000f0:SSL routines:OPENSSL_internal:UNSUPPORTED_PROTOCOL:..\\..\\third_party\\boringssl\\src\\ssl\\handshake_client.c',
+        ),
+      },
+    );
+    const err = await a.query('SELECT 1').then(
+      () => {
+        throw new Error('应抛错');
+      },
+      (e: unknown) => e,
+    );
+    const msg = msgOf(err);
+    expect(msg).toMatch(/TCP 已连通/);
+    expect(msg).toMatch(/trustServerCertificate/);
+    // 协议版本类错误不含证书字样，修复前会落「网络不可达」兜底
+    expect(msg).not.toMatch(/^网络不可达/);
+    await a.close();
+  });
+
   it('非 TLS 的连接失败不追加证书指引（避免噪音）', async () => {
     const { a, pool } = await make();
     pool.failWith = mssqlErr('ConnectionError', 'ESOCKET', {

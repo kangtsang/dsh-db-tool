@@ -457,6 +457,7 @@ interface MssqlErrLike {
   lineNumber?: unknown;
   message?: unknown;
   originalError?: unknown;
+  cause?: unknown;
   precedingErrors?: unknown;
 }
 
@@ -482,8 +483,18 @@ function mssqlReason(e: unknown): string {
   // 默认 encrypt=true + trustServerCertificate=false 与 mssql 官方一致（不改默认值），但必须：
   //  1) 不把「TCP 已连通、TLS 校验失败」误报成网络不可达（会把用户引向错误排查方向）；
   //  2) 把「怎么连上」写清楚（URL 加 ?trustServerCertificate=true / ?encrypt=false）。
-  const tlsText = `${detail} ${errText(err.originalError)}`;
-  const tlsish = /self[ -]?signed|certificate|unable to verify|wrong version number|ERR_SSL|EPROTO|CERT_/i.test(tlsText);
+  // tedious 建连期把底层 socket/TLS 错误用 ES cause 选项挂在 err.cause（originalError 是 mssql 事务
+  // abort 专用，建连场景恒 undefined），message 已聚合底层原文但读 cause 更稳，一并纳入特征文本。
+  const causeText = errText(err.cause);
+  const tlsText = `${detail} ${errText(err.originalError)} ${causeText}`;
+  // 特征族来源：OpenSSL/BoringSSL 原生错误串（SSL routines/OPENSSL_internal/UNSUPPORTED_PROTOCOL、
+  // handshake_*.c）、Node ERR_SSL_NO_PROTOCOLS_AVAILABLE 的 message、服务器 alert 拒绝握手/版本。
+  // 刻意不加 ECONNRESET/socket hang up/ENOTFOUND——与真实网络故障不可区分，误加会让 ECONNREFUSED
+  // 场景被套上 TLS 指引。
+  const tlsish =
+    /self[ -]?signed|certificate|unable to verify|wrong version number|ERR_SSL|EPROTO|CERT_|UNSUPPORTED_PROTOCOL|SSL[ -_]?routines|OPENSSL_internal|handshake[ _-]?(failure|client|server)|TLSV1_ALERT|SSLV3_ALERT|alert protocol version|alert handshake failure|no protocols available/i.test(
+      tlsText,
+    );
 
   let base: string;
   switch (code) {
@@ -500,7 +511,7 @@ function mssqlReason(e: unknown): string {
       // 保留「网络不可达」字样（既有断言与用户检索习惯依赖），但 TLS 特征时先说明 TCP 已连通
       base = tlsish
         ? `TCP 已连通但 TLS 握手/证书校验失败（不是网络不可达：网络不可达指主机/端口不可达或连接被拒，此处 TCP 已建立）（${detail}）`
-        : `网络不可达：无法与服务器建立 TCP 连接，请检查主机名、端口与网络（${detail}）`;
+        : `网络不可达：无法与服务器建立 TCP 连接，请检查主机名、端口与网络；端口确认可达仍反复出现时，也可能是服务器在 TLS 握手阶段主动断开（如老实例仅支持 TLS 1.0）（${detail}）`;
       break;
     // 服务器强制加密（SQL Server 2022 / Azure SQL 默认）而客户端 encrypt=false：tedious 抛英文原文，
     // 不映射则中文界面里只剩英文，故单列一条给出可直接照做的改法。
@@ -531,6 +542,16 @@ function mssqlReason(e: unknown): string {
     );
   }
   if (err.originalError !== undefined) trail.push(`原始错误: ${errText(err.originalError)}`);
+  else if (
+    err.cause !== undefined &&
+    err.cause !== null &&
+    errText(err.cause) !== detail &&
+    !detail.includes(errText(err.cause))
+  ) {
+    // 建连错误（ESOCKET 等）的底层错误在 cause 且已被 tedious 拼进 message 尾段；仅当
+    // message 未包含其全文（如被截断/包装）时补一条干净的底层错误，避免重复
+    trail.push(`原始错误: ${errText(err.cause)}`);
+  }
   if (Array.isArray(err.precedingErrors) && err.precedingErrors.length > 0) {
     trail.push(`前序错误: ${err.precedingErrors.map(errText).join('; ')}`);
   }

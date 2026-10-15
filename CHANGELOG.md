@@ -1,5 +1,15 @@
 # Changelog — dsh-db-tool
 
+## 1.8.2
+
+SQL Server TLS 握手失败的错误分类修复（真实案例驱动：老实例仅 TLS 1.0 对客户端最低 TLS 1.2 的握手失败被误报为网络不可达）。
+
+### 修复
+
+- **TLS 协议版本不符不再误报「网络不可达」**：底层 BoringSSL/OpenSSL 握手错误（`UNSUPPORTED_PROTOCOL`、`SSL routines`、`OPENSSL_internal`、handshake alert、`no protocols available` 等）此前不被 TLS 特征正则命中，落进「网络不可达：请检查主机名、端口与网络」兜底，把用户引向错误排查方向；现补全特征族，正确报「TCP 已连通但 TLS 握手/证书校验失败」并附 `?encrypt=false` / `?trustServerCertificate=true` 指引。tedious 把 TCP 失败与 TLS 失败包成同一 ESOCKET/同一消息模板，按底层错误串区分是官方结构下的正确做法。
+- **特征文本与「原始错误」追溯纳入 ES cause**：tedious 建连期把底层错误挂在 `err.cause`（`originalError` 是事务 abort 专用，建连场景恒 undefined），此前特征匹配读不到、追溯 trail 恒不生效；现纳入 cause，message 未含其全文时补出干净的底层错误。
+- **「网络不可达」兜底文案补提示**：端口确认可达仍反复出现时，可能是服务器在 TLS 握手阶段主动断开（如老实例仅支持 TLS 1.0）——覆盖 `socket hang up` 这类无法按关键词识别的形态。
+
 ## 1.8.1
 
 SQL Server 连接官方文档对照修复 + 全库端口 fail-open 治理。

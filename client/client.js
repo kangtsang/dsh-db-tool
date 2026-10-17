@@ -3201,7 +3201,7 @@ window.__ModuleLoader__.load({
 					target: { conn: "", kind: "", db: "", mode: "" },
 				});
 				if (!yes) return;
-				api("transfer-history/clear", { method: "POST", body: {} })
+				api("transfer-history/clear", { method: "POST", body: { projectPath } })
 					.then((r) => { setMessage(t("ok") + " (" + (r && r.removed != null ? r.removed : 0) + ")"); setHistory([]); })
 					.catch((e) => setError(String(e && e.message ? e.message : e)));
 			}

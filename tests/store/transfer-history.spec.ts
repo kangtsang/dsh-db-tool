@@ -35,4 +35,15 @@ describe('TransferLog', () => {
     expect(h.tail(10)).toEqual([]);
     expect(h.clear()).toBe(0);
   });
+
+  it('clear(projectKey) 只清除该项目（损坏行保留）；无参仍全清', () => {
+    const h = store();
+    h.append({ type: 'start', taskId: 't1', projectPathKey: 'proj-a', statement: 's' });
+    h.append({ type: 'finish', taskId: 't2', projectPathKey: 'proj-b', statement: 's', status: 'done', tables: [], failures: [] });
+    require('node:fs').appendFileSync(path.join(dir!, 'transfer-log.jsonl'), '{broken\n');
+    expect(h.clear('proj-a')).toBe(1);
+    expect(h.tail(10).map((e) => e.projectPathKey)).toEqual(['proj-b']);
+    expect(h.clear()).toBe(1);
+    expect(h.tail(10)).toEqual([]);
+  });
 });

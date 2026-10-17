@@ -258,7 +258,6 @@ export function startTransferTask(
     try {
       prog.status = 'running';
     emit({ type: 'table', status: 'running', table: name, rows: 0, totalRows: null });
-    emit({ type: 'table', status: 'running', table: name, rows: 0, totalRows: null });
       const r = await createTransferReader(source, srcLoc);
       reader = r; // 立即回填外层引用：writer 创建抛错时 finally 仍能关闭已打开的 reader
       const w = await createTransferWriter(target, opts.writeMode, dstLoc);

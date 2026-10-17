@@ -1,5 +1,19 @@
 # Changelog — dsh-db-tool
 
+## 1.8.3
+
+DSH 0.2.1-rc.2 适配确认（宿主 API 契约逐项对照，零代码变更）+ 传输日志两处修复。
+
+### 适配
+
+- **DSH 0.2.1-rc.2 适配确认**：对照最新宿主源码逐项验证插件契约——`dsh.client`（platform/inject）、prefix 路由（`WebRouteKind`）、`connection.requestRejection`（401|403|undefined）、`tools.register`（output.schema/render/timeoutMs、`exec.agent.session`）、`window.__ModuleLoader__.load` 注册协议、`sessions.header.cwd`/`webRuntime.trustedHosts`——全部兼容；0.2.1 系列相对 0.2.0-rc.2 零代码变更，`engines.dsh` 范围已覆盖，无需代码改动。
+- **依赖升级**：`dsh-better-sidebar` ^0.24.1 → ^0.28.0（0.25–0.28 为可选增量字段，本项目所用 `registerTab`/`TabDescriptor` 基础面无破坏性变更；peer 整套对齐 DSH 0.2.1-rc.1）；`@deepseek-ai/cordis` ^4.0.4 → ^4.0.5。
+
+### 修复
+
+- **传输历史「清除」按项目生效**：前端确认文案承诺「清除当前项目的全部传输历史」，实际 `transfer-history/clear` 无参全清——多项目共用一个 DSH 实例时，一个项目清历史会误删其他项目的记录。现 `TransferLog.clear(projectKey?)` 按项目过滤（`transferLogTail` 同款归一化），HTTP 路由读 body 的 `projectPath`，前端历史区带项目路径调用；日志区「清除全部传输日志」语义不变（无参全清）。审计语句区分按项目/全量。
+- **传输日志重复 running 事件**：`lib/transfer.ts` 单表开始事件 emit 两次（编辑事故残留），日志与传输日志标签页每表出现两条「开始」；删除重复行，补「每任务单表至多一条 running 事件」回归断言。
+
 ## 1.8.2
 
 SQL Server TLS 握手失败的错误分类修复（真实案例驱动：老实例仅 TLS 1.0 对客户端最低 TLS 1.2 的握手失败被误报为网络不可达）。

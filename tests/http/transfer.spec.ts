@@ -212,4 +212,38 @@ describe.skipIf(!anySqlite)('transfer 路由（sqlite 端到端）', () => {
     const r6 = await get(`/api/transfer/no-such-task?${pj(projectA)}`);
     expect(r6).toMatchObject({ ok: false, code: 'NOT_FOUND' });
   }, 30000);
+
+  it('transfer-log 单表 running 事件不重复；transfer-history/clear 按项目清除（他项目条目保留）', async () => {
+    // 前序用例已为 projectA 落多条传输日志；直写一条他项目条目（不经授权链）
+    const log = (service as unknown as { store: DbToolStore }).store.transferLog;
+    log.append({ type: 'finish', taskId: 't-other', projectPathKey: normalizeProjectKey(projectB), statement: 'other', status: 'done', tables: [], failures: [] });
+
+    // 每个任务的单表至多一条 running 事件（重复 emit 是编辑事故回归）
+    const logRows = await get(`/api/transfer-log?limit=2000&${pj(projectA)}`);
+    expect(logRows).toMatchObject({ ok: true });
+    const runningPerTaskTable = new Map<string, number>();
+    for (const e of logRows.data as Array<{ type: string; status?: string; taskId: string; table?: string }>) {
+      if (e.type === 'table' && e.status === 'running') {
+        const k = `${e.taskId}:${e.table}`;
+        runningPerTaskTable.set(k, (runningPerTaskTable.get(k) ?? 0) + 1);
+      }
+    }
+    expect(runningPerTaskTable.size).toBeGreaterThan(0);
+    for (const [k, n] of runningPerTaskTable) expect(n, k).toBe(1);
+
+    // clear 带项目路径：只删本项目，他项目条目保留
+    const r = await post('/api/transfer-history/clear', { projectPath: projectA });
+    expect(r).toMatchObject({ ok: true });
+    expect((r.data as { removed: number }).removed).toBeGreaterThan(0);
+    const afterA = await get(`/api/transfer-history?limit=30&${pj(projectA)}`);
+    expect(afterA.data).toEqual([]);
+    const afterOther = await get(`/api/transfer-history?limit=30&${pj(projectB)}`);
+    expect(afterOther.data.map((x: { taskId: string }) => x.taskId)).toContain('t-other');
+
+    // clear 无参：全清（含他项目残留与日志区全清语义）
+    const rAll = await post('/api/transfer-history/clear', {});
+    expect(rAll).toMatchObject({ ok: true });
+    const afterAll = await get(`/api/transfer-history?limit=30&${pj(projectB)}`);
+    expect(afterAll.data).toEqual([]);
+  }, 30000);
 });

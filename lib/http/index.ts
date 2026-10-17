@@ -332,7 +332,8 @@ async function route(
     return sendOk(res, service.transferHistory(projectOf(q), limit));
   }
   if (path === '/api/transfer-history/clear' && req.method === 'POST') {
-    return sendOk(res, service.transferHistoryClear());
+    const b = await readBody(req);
+    return sendOk(res, service.transferHistoryClear(projectOfBody(b)));
   }
   const transferMatch = /^\/api\/transfer\/([^/]+)(\/cancel)?$/.exec(path);
   if (transferMatch) {

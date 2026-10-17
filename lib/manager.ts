@@ -1105,10 +1105,11 @@ export class DbToolService {
       : this.store.transferLog.tail(n);
   }
 
-  /** 清除传输历史：全量清除（历史区与文件同步清空）。留审计。 */
-  transferHistoryClear(): { removed: number } {
-    const removed = this.store.transferLog.clear();
-    this.audit('', '', 'transfer_history_clear', '清除全部传输历史', 'none', false, true);
+  /** 清除传输历史：projectPath 给定时只清该项目（前端文案语义），缺省全清。留审计。 */
+  transferHistoryClear(projectPath?: string): { removed: number } {
+    const key = projectPath && projectPath.trim() !== '' ? normalizeProjectKey(projectPath) : undefined;
+    const removed = this.store.transferLog.clear(key);
+    this.audit(key ?? '', '', 'transfer_history_clear', key !== undefined ? `清除项目传输历史: ${key}` : '清除全部传输历史', 'none', false, true);
     return { removed };
   }
 

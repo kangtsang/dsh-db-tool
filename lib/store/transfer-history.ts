@@ -127,8 +127,8 @@ export class TransferLog {
     return out.reverse();
   }
 
-  /** 清除全部日志。返回删除条数 */
-  clear(): number {
+  /** 清除日志；projectKey 给定时只删该项目条目，缺省全清。返回删除条数 */
+  clear(projectKey?: string): number {
     if (!fs.existsSync(this.filePath)) return 0;
     const lines = fs.readFileSync(this.filePath, 'utf8').split('\n');
     const kept: string[] = [];
@@ -137,7 +137,11 @@ export class TransferLog {
       const t = line.trim();
       if (!t) continue;
       try {
-        JSON.parse(t) as TransferLogEntry;
+        const e = JSON.parse(t) as TransferLogEntry;
+        if (projectKey !== undefined && e.projectPathKey !== projectKey) {
+          kept.push(t); // 他项目条目原样保留
+          continue;
+        }
         removed += 1;
       } catch {
         kept.push(t); // 损坏行原样保留

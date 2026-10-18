@@ -44,6 +44,8 @@ interface DshContext {
       handler: (req: unknown, res: unknown) => Promise<void> | void;
     }): () => void;
   };
+  /** 可选服务读取（cordis 反射层）：不进 inject，缺失时返回 undefined */
+  get?: (name: string, strict?: boolean) => unknown;
   webRuntime?: { trustedHosts?: string[] };
   /** Connection 服务（0.2.0-rc.1 web-app bundle 常驻行）：宿主级请求鉴权栅栏。 */
   connection?: {
@@ -54,8 +56,15 @@ interface DshContext {
   logger?: { info?: (...a: unknown[]) => void; error?: (...a: unknown[]) => void };
 }
 
-/** cordis 注入清单（服务名以 dsh-ssh-tunnel 为准；connection 用于宿主鉴权栅栏） */
-export const inject = ['webServer', 'sessions', 'tools', 'webRuntime', 'connection'];
+/**
+ * cordis 注入清单（服务名以 dsh-ssh-tunnel 为准；connection 用于宿主鉴权栅栏）。
+ *
+ * 注意：不要把 webRuntime 写进来。宿主 @deepseek-ai/dsh-web-app 提供的是
+ * webApp，从不注册 webRuntime；cordis 的 inject 是硬依赖，缺失服务会让 fiber
+ * 永久 pending、apply() 不执行，HTTP 路由也就不会注册（前端表现为 HTTP 404）。
+ * trustedHosts 改用 ctx.get('webRuntime', true) 可选读取。
+ */
+export const inject = ['webServer', 'sessions', 'tools', 'connection'];
 
 const TOOL_DESCRIPTION = `数据库管理工具（dsh-db-tool）：在已配置的数据库连接上执行查询/写操作/脚本。
 
@@ -86,7 +95,9 @@ export function apply(ctx: DshContext): void {
   // HTTP API：挂在 DSH webServer 的 /dsh-db-tool/api 前缀下（同源访问）
   const trustedHosts = (): string[] => {
     try {
-      return ctx.webRuntime?.trustedHosts ?? [];
+      // webRuntime 不在 inject 内：缺失服务会让插件永不激活，故可选读取
+      const runtime = ctx.get?.('webRuntime', true) as { trustedHosts?: string[] } | undefined;
+      return runtime?.trustedHosts ?? [];
     } catch {
       return [];
     }

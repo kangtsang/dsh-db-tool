@@ -1,5 +1,14 @@
 # Changelog — dsh-db-tool
 
+## 1.8.4
+
+修复插件在 DSH 0.2.1 宿主上永不激活、面板报「错误: HTTP 404」（`inject` 声明了宿主不存在的 `webRuntime`）。
+
+### 修复
+
+- **插件不激活导致 HTTP 404**：宿主 `@deepseek-ai/dsh-web-app` 提供的是 `webApp`，从不注册 `webRuntime`；而 cordis 的 `inject` 是硬依赖——任一服务取不到，fiber 永久 pending，`apply()` 不执行，`/dsh-db-tool/api` 前缀路由也就不会注册，前端同源 `fetch` 落到宿主兜底 404，启动期只有一条 warning、不报错。现从 `inject` 移除 `webRuntime`，`trustedHosts` 改为 `ctx.get('webRuntime', true)` 可选读取（对齐 dsh-ssh-tunnel 的既有写法），缺失时退化为空信任列表，loopback + Origin 同源校验照旧生效。1.8.3 中「`webRuntime.trustedHosts` 兼容已确认」的结论作废。
+- **回归防护**：新增 `tests/plugin/apply.spec.ts`，锁住「`inject` 不含 `webRuntime`」与「无 `webRuntime` 时仍注册 `/dsh-db-tool/api` prefix 路由、handler 按 loopback 放行」。
+
 ## 1.8.3
 
 DSH 0.2.1-rc.2 适配确认（宿主 API 契约逐项对照，零代码变更）+ 传输日志两处修复。

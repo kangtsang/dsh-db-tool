@@ -1,5 +1,26 @@
 # Changelog — dsh-db-tool
 
+## 1.8.5
+
+DSH 0.2.1-rc.3 适配确认（宿主契约逐项对照，客户端与打包零改动）+ 非 loopback 部署信任来源修复 + hotfix 支持 0.2.1-rc.3。
+
+### 适配
+
+- **DSH 0.2.1-rc.3 契约逐项对照（零客户端改动）**：`tools.register`（`output.schema`/`render`、`timeoutMs`）、`webServer.register({kind:'prefix'})`、`connection.requestRejection`（401|403|undefined）、`sessions.header.cwd`、`ctx.effect`、客户端 `dsh.client`（platform/inject）、`ctx.locale.register(ns,lang,dict)`/`subscribe`/`getSnapshot`、`betterSidebar.registerTab`、`window.__ModuleLoader__.load` 注册协议——rc.2→rc.3 均无实质变更（上游逐字节 diff + 本机 rc.3 `app.asar` 提取件交叉验证）。`client/client.js`、`cordis.patch.yml`、构建脚本无需改动；运行态实测工具端到端可用、client combo 产物按 rc.3 契约可执行。rc.3 新增的「更多菜单/入口定制」只作用于官方 `sidebar.panellist` slot，与本插件经 better-sidebar 注册的 tab 无冲突。
+- **`engines.dsh` 补充 `>=0.2.1-rc.2 <0.3.0-0`**：严格 semver 下 prerelease 需显式元组，原范围对 `0.2.1-rc.x` 判为不匹配（宿主准入门用 `includePrerelease` 放行，npm 侧声明此前不准确）。
+- **hotfix 支持 0.2.1-rc.3**：rc.3 的 `dsh-app-boot` 仍有两处未防护的 `createRequire(parent).resolve.paths(name)`（`nativePackageDir` / `routeScoped`），新增 `patches/dsh-app-boot-route-scoped-hotfix-0.2.1-rc.3.patch` 并加入 `TARGET_VERSIONS`/`PATCH_BY_VERSION`；`git apply` 与内建替换双路径逐字节一致，未加 `--force` 即可应用，幂等与 `--revert` 均实测通过。
+
+### 修复
+
+- **非 loopback 部署被插件兜底 403**：宿主 `@deepseek-ai/dsh-web-app` 自 0.2.x 起只 `provide` `webApp`/`webStartup`，从不注册 `webRuntime`（rc.2、rc.3 内均 0 命中）；旧实现读 `ctx.get('webRuntime', true)` 恒得 `undefined` → `trustedHosts` 恒空，`--trusted-host`/内网反向代理部署在宿主 Connection 放行后仍被插件自带 trust 校验判 403。现 `webStartup.trustedHosts` 优先、`webRuntime` 回退（兼容旧宿主），并在 `webStartup` 存在时补监听 bind 地址（仅接受具体单播 IP 字面量；`0.0.0.0`/`::`/`*`/loopback 一律跳过，不放宽 DNS rebinding 攻击面）。loopback 行为与既有部署不变。
+
+### 验证
+
+- `npx tsc --noEmit` 0 错误；`npx vitest run` 1043 通过 / 0 失败 / 33 跳过（新增 `tests/plugin/rc3-trust.spec.ts` 14 条 + hotfix rc.3 相关 10 条）；`npm run build` 成功，产物齐全。
+- 运行态（本机 DSH 0.2.1-rc.3）：`DatabaseManager` 工具注册并端到端调用成功；`/dsh-db-tool/api` 前缀路由已挂载（无凭证 401、未知路径 404）；client combo 产物 200 且按 rc.3 契约执行通过。
+
+> 1.8.3 的「`webRuntime.trustedHosts` 兼容已确认」结论作废：该服务在 0.2.x 内核中并不存在，应读 `webStartup.trustedHosts`。
+
 ## 1.8.4
 
 修复插件在 DSH 0.2.1 宿主上永不激活、面板报「错误: HTTP 404」（`inject` 声明了宿主不存在的 `webRuntime`）。

@@ -5,7 +5,9 @@
  * 调用 handleDbToolRequest——前端同源相对路径 fetch 即可达。
  *
  * trust 校验（等价移植 dsh-ssh-tunnel lib/shared/http-trust.js，自包含）：
- *  - Host 必须是 loopback（或 ctx.webRuntime.trustedHosts 中的条目）；
+ *  - Host 必须是 loopback（或受信条目）：0.2.1-rc.3 起来自 ctx.webStartup.trustedHosts
+ *    加监听 bind 地址（Connection 的 isBindAddressAuthority 语义），旧宿主来自已删除的
+ *    ctx.webRuntime.trustedHosts；
  *  - 带 Origin/Referer 时其 host 必须是 loopback（且同端口）或受信条目。
  *  - 0.0.0.0 不是 loopback。违者 403 FORBIDDEN。
  *
@@ -76,7 +78,10 @@ export function isTrustedRequest(req: Pick<IncomingMessage, 'headers'>, trustedH
 /* ---------------- 请求处理入口 ---------------- */
 
 export interface DbToolRequestOptions {
-  /** 受信主机列表（通常来自 ctx.webRuntime.trustedHosts） */
+  /**
+   * 受信主机列表。0.2.1-rc.3 起来自 ctx.webStartup.trustedHosts 加监听 bind 地址；
+   * 旧宿主来自 ctx.webRuntime.trustedHosts（rc.3 已删除该服务）。
+   */
   trustedHosts?: string[];
   /**
    * 项目上下文权威解析（对齐 dsh-ssh-tunnel 的 getProjectContext）：

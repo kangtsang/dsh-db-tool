@@ -23,13 +23,15 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 /** 补丁文件里的目标版本声明行（patches/*.patch 注释头）。 */
 export const TARGET_VERSION = '0.1.7-rc.2';
-/** 锚点行逐字节一致的受支持版本列表（仅整体行号偏移；0.2.0-rc.1/0.2.0-rc.2 的 lib/index.js 逐字节相同）。 */
-export const TARGET_VERSIONS = ['0.1.7-rc.2', '0.2.0-rc.1', '0.2.0-rc.2'];
+/** 锚点行逐字节一致的受支持版本列表（仅整体行号偏移；0.2.0-rc.1/0.2.0-rc.2 的 lib/index.js 逐字节相同；
+ * 0.2.1-rc.3 锚点内容同样逐字节一致，仅整体行号偏移（npd +123 / routeScoped +205）。 */
+export const TARGET_VERSIONS = ['0.1.7-rc.2', '0.2.0-rc.1', '0.2.0-rc.2', '0.2.1-rc.3'];
 /** 各受支持版本对应的默认补丁文件名（patches/ 下；git-apply 路径按版本选择）。 */
 export const PATCH_BY_VERSION = {
 	'0.1.7-rc.2': 'dsh-app-boot-route-scoped-hotfix.patch',
 	'0.2.0-rc.1': 'dsh-app-boot-route-scoped-hotfix-0.2.0-rc.1.patch',
 	'0.2.0-rc.2': 'dsh-app-boot-route-scoped-hotfix-0.2.0-rc.2.patch',
+	'0.2.1-rc.3': 'dsh-app-boot-route-scoped-hotfix-0.2.1-rc.3.patch',
 };
 /** 判断目标文件是否已打补丁的标识串（hotfix 注释首行片段）。 */
 export const HOTFIX_MARKER = 'local hotfix: resolve.paths returns null';

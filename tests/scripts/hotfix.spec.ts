@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
+import { createRequire } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -401,5 +402,223 @@ describe('git apply path', () => {
 			path.join(repoRoot, 'patches', PATCH_BY_VERSION['0.2.0-rc.2']!),
 			'0.2.0-rc.2',
 		);
+	});
+});
+
+/* ---------------- 0.2.1-rc.3（DSH 0.2.1-rc.3 适配） ---------------- */
+
+const RC3 = '0.2.1-rc.3';
+const rc3PatchFile = path.join(repoRoot, 'patches', PATCH_BY_VERSION[RC3]!);
+
+/** git 可用性（与现有 gitApplyContract 同一判据，供内联 fixture 用例复用）。 */
+function gitAvailable(): boolean {
+	try {
+		execFileSync('git', ['--version'], { stdio: 'ignore' });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** nativePackageDir hunk 的 7 行原文（上下文 3 + 原始缺陷行 + 上下文 3）。 */
+const NPD_HUNK_LINES = [
+	'\treturn treePrefix + (end < 0 ? rest : rest.slice(0, end));',
+	'}',
+	'function nativePackageDir(parent, name) {',
+	// 注意：nativePackageDir 函数体内是 1 个 tab 缩进（与 routeScoped 的 2 tab 不同）
+	ORIGINAL_NPD_BLOCK.split('\n')[1]!,
+	'\t\tconst candidate = join(searchPath, name);',
+	'\t\tif (existsSync(join(candidate, "package.json"))) return candidate;',
+	'\t}',
+];
+
+/** routeScoped hunk 的 7 行原文。 */
+const ROUTE_HUNK_LINES = [
+	'\t\tconst target = resolution.entries.get(name);',
+	'\t\tconst candidates = [];',
+	'\t\tconst localSearchPaths = [];',
+	ORIGINAL_LINE,
+	'\t\t\tif (!searchPath.startsWith(layer.localPrefix)) break;',
+	'\t\t\tlocalSearchPaths.push(searchPath);',
+	'\t\t\tconst candidate = localPackageCandidate(searchPath, name, flavor);',
+];
+
+/**
+ * 按 hunk 头的旧文件行号构造最小 LF fixture（行号对齐，其余行用填充行）。
+ * 不依赖 /tmp 提取件、npm pack 或网络——补丁的上下文行在此逐字节复现。
+ */
+function buildAlignedFixture(segments: Array<{ start: number; lines: string[] }>): string {
+	const out: string[] = [];
+	const sorted = [...segments].sort((a, b) => a.start - b.start);
+	let cursor = 1;
+	for (const seg of sorted) {
+		while (cursor < seg.start) {
+			out.push(`// filler ${cursor}`);
+			cursor++;
+		}
+		for (const line of seg.lines) {
+			out.push(line);
+			cursor++;
+		}
+	}
+	out.push('');
+	return out.join('\n');
+}
+
+/** 各受支持版本的 hunk 起点（来自各 patch 的 @@ 头）。 */
+const HUNK_START_BY_VERSION: Record<string, { npd: number; route: number }> = {
+	'0.1.7-rc.2': { npd: 1244, route: 1419 },
+	'0.2.0-rc.1': { npd: 1245, route: 1420 },
+	'0.2.0-rc.2': { npd: 1245, route: 1420 },
+	'0.2.1-rc.3': { npd: 1368, route: 1625 },
+};
+
+function fixtureForVersion(version: string): string {
+	const starts = HUNK_START_BY_VERSION[version];
+	if (!starts) throw new Error(`no hunk map for ${version}`);
+	return buildAlignedFixture([
+		{ start: starts.npd, lines: NPD_HUNK_LINES },
+		{ start: starts.route, lines: ROUTE_HUNK_LINES },
+	]);
+}
+
+describe('0.2.1-rc.3 patch file contract', () => {
+	it('is registered for the rc.3 version and exists with the declared target version', () => {
+		expect(PATCH_BY_VERSION[RC3]).toBe('dsh-app-boot-route-scoped-hotfix-0.2.1-rc.3.patch');
+		expect(TARGET_VERSIONS).toContain(RC3);
+		expect(fs.existsSync(rc3PatchFile)).toBe(true);
+		expect(parsePatchTargetVersion(fs.readFileSync(rc3PatchFile, 'utf8'))).toBe(RC3);
+	});
+
+	it('has rc.3 line-shifted hunk headers and the same hotfix blocks byte-for-byte', () => {
+		const text = fs.readFileSync(rc3PatchFile, 'utf8');
+		// 0.2.1-rc.3 的 lib/index.js：npd for 行 1371、routeScoped for 行 1628
+		expect(text).toContain('@@ -1368,7 +1368,10 @@');
+		expect(text).toContain('@@ -1625,7 +1628,14 @@');
+		expect(text).toContain(HOTFIX_MARKER);
+		const routeAdded = extractAddedLines(text, '@@ -1625,7 +1628,14 @@');
+		expect(HOTFIX_BLOCK.split('\n')).toEqual(routeAdded);
+		const npdAdded = extractAddedLines(text, '@@ -1368,7 +1368,10 @@');
+		expect(FIXED_NPD_BLOCK.split('\n').slice(1)).toEqual(npdAdded);
+	});
+
+	it('keeps one patch per supported version and every patch declares its own version', () => {
+		expect(PATCH_BY_VERSION['0.1.7-rc.2']).toBe('dsh-app-boot-route-scoped-hotfix.patch');
+		expect(PATCH_BY_VERSION['0.2.0-rc.1']).toBe('dsh-app-boot-route-scoped-hotfix-0.2.0-rc.1.patch');
+		expect(PATCH_BY_VERSION['0.2.0-rc.2']).toBe('dsh-app-boot-route-scoped-hotfix-0.2.0-rc.2.patch');
+		expect(PATCH_BY_VERSION[RC3]).toBe('dsh-app-boot-route-scoped-hotfix-0.2.1-rc.3.patch');
+		for (const [version, file] of Object.entries(PATCH_BY_VERSION)) {
+			const text = fs.readFileSync(path.join(repoRoot, 'patches', file), 'utf8');
+			expect(parsePatchTargetVersion(text)).toBe(version);
+		}
+	});
+
+	it.skipIf(!gitAvailable())('applies cleanly to a line-aligned LF fixture via git apply (no network)', () => {
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-hotfix-rc3-git-'));
+		try {
+			const fixture = fixtureForVersion(RC3);
+			const work = path.join(tmp, 'pkg', 'lib');
+			fs.mkdirSync(work, { recursive: true });
+			fs.writeFileSync(path.join(work, 'index.js'), fixture, 'utf8');
+
+			// --check：证明补丁上下文与 rc.3 行号布局逐字节匹配
+			execFileSync(
+				'git',
+				['-c', 'core.autocrlf=false', 'apply', '--check', '-p1', '--directory', 'pkg', rc3PatchFile],
+				{ cwd: tmp },
+			);
+			// 真应用：两处 hunk 都生效，且与内建替换路径逐字节一致
+			execFileSync(
+				'git',
+				['-c', 'core.autocrlf=false', 'apply', '-p1', '--directory', 'pkg', rc3PatchFile],
+				{ cwd: tmp },
+			);
+			const patched = fs.readFileSync(path.join(work, 'index.js'), 'utf8');
+			expect(isApplied(patched)).toBe(true);
+			expect(isNpdApplied(patched)).toBe(true);
+			expect(patched).not.toContain(ORIGINAL_LINE);
+			expect(patched).not.toContain(ORIGINAL_NPD_BLOCK);
+			expect(patched).toBe(applyToContent(fixture).content);
+		} finally {
+			fs.rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(!gitAvailable())('selects the rc.3 patch for an installed 0.2.1-rc.3 (no exit 2, git-apply path)', () => {
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-hotfix-rc3-select-'));
+		try {
+			const fixture = fixtureForVersion(RC3);
+			makeFakeDsh(tmp, fixture, RC3);
+			const res = spawnSync(process.execPath, [coreFile, '--dsh-root', tmp], { encoding: 'utf8' });
+			expect(res.status).toBe(0);
+			expect(res.stderr).not.toContain('version mismatch');
+			// 只有选中行号匹配的 rc.3 补丁才会走 git-apply；选错补丁会失配回退 builtin-replace
+			expect(res.stdout).toContain('via git-apply');
+		} finally {
+			fs.rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+
+	for (const version of ['0.1.7-rc.2', '0.2.0-rc.1', '0.2.0-rc.2']) {
+		it.skipIf(!gitAvailable())(
+			`keeps selecting the per-version patch for an installed ${version} (git-apply path)`,
+			() => {
+				const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-hotfix-ver-select-'));
+				try {
+					makeFakeDsh(tmp, fixtureForVersion(version), version);
+					const res = spawnSync(process.execPath, [coreFile, '--dsh-root', tmp], { encoding: 'utf8' });
+					expect(res.status).toBe(0);
+					expect(res.stdout).toContain('via git-apply');
+				} finally {
+					fs.rmSync(tmp, { recursive: true, force: true });
+				}
+			},
+		);
+	}
+
+	it('is idempotent on the rc.3 fixture (second run reports already applied) and reverts byte-for-byte', () => {
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-hotfix-rc3-idem-'));
+		try {
+			const fixture = fixtureForVersion(RC3);
+			const bootRoot = makeFakeDsh(tmp, fixture, RC3);
+			const indexFile = path.join(bootRoot, 'lib', 'index.js');
+
+			const first = spawnSync(process.execPath, [coreFile, '--dsh-root', tmp], { encoding: 'utf8' });
+			expect(first.status).toBe(0);
+			const after = fs.readFileSync(indexFile, 'utf8');
+			expect(isApplied(after)).toBe(true);
+			expect(isNpdApplied(after)).toBe(true);
+
+			const second = spawnSync(process.execPath, [coreFile, '--dsh-root', tmp], { encoding: 'utf8' });
+			expect(second.status).toBe(0);
+			expect(second.stdout).toContain('already applied');
+
+			const reverted = spawnSync(process.execPath, [coreFile, '--dsh-root', tmp, '--revert'], {
+				encoding: 'utf8',
+			});
+			expect(reverted.status).toBe(0);
+			expect(fs.readFileSync(indexFile, 'utf8')).toBe(fixture);
+		} finally {
+			fs.rmSync(tmp, { recursive: true, force: true });
+		}
+	});
+});
+
+describe('package.json engines.dsh（严格 semver）', () => {
+	it('accepts supported DSH versions and rejects 0.3.x', () => {
+		const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')) as {
+			engines?: { dsh?: string };
+		};
+		const range = pkg.engines?.dsh;
+		expect(typeof range).toBe('string');
+		const require = createRequire(import.meta.url);
+		const semver = require('semver') as { satisfies(version: string, range: string): boolean };
+
+		for (const version of ['0.2.1-rc.3', '0.2.1-rc.2', '0.2.0-rc.2', '0.1.7-rc.2']) {
+			expect(semver.satisfies(version, range!), `${version} 应在 engines.dsh 范围内`).toBe(true);
+		}
+		for (const version of ['0.3.0-0', '0.3.0']) {
+			expect(semver.satisfies(version, range!), `${version} 不应在 engines.dsh 范围内`).toBe(false);
+		}
 	});
 });

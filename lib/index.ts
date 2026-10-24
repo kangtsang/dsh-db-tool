@@ -10,6 +10,7 @@
  *    http-trust 本地校验（Host loopback / trustedHosts + Origin 同源校验）。
  *  - ctx.effect 收尾：注销 HTTP 路由、关适配器、停 challenge 清理。
  */
+import { isIP } from 'node:net';
 import { DbToolStore, normalizeProjectKey } from './store/index.js';
 import { DbToolService, handleToolAction, type ToolActionArgs } from './manager.js';
 import { handleDbToolRequest } from './http/index.js';
@@ -43,9 +44,14 @@ interface DshContext {
       path: string;
       handler: (req: unknown, res: unknown) => Promise<void> | void;
     }): () => void;
+    /** 监听地址/端口 getter（rc.1 与 rc.3 都提供）。rc.3 的 Connection 单独接受 bind 地址。 */
+    host?: string;
+    port?: number;
   };
   /** 可选服务读取（cordis 反射层）：不进 inject，缺失时返回 undefined */
   get?: (name: string, strict?: boolean) => unknown;
+  /** 0.2.1-rc.3 的信任权威来源（--trusted-host 值），取代已删除的 webRuntime 服务。 */
+  webStartup?: { trustedHosts?: string[] };
   webRuntime?: { trustedHosts?: string[] };
   /** Connection 服务（0.2.0-rc.1 web-app bundle 常驻行）：宿主级请求鉴权栅栏。 */
   connection?: {
@@ -62,7 +68,9 @@ interface DshContext {
  * 注意：不要把 webRuntime 写进来。宿主 @deepseek-ai/dsh-web-app 提供的是
  * webApp，从不注册 webRuntime；cordis 的 inject 是硬依赖，缺失服务会让 fiber
  * 永久 pending、apply() 不执行，HTTP 路由也就不会注册（前端表现为 HTTP 404）。
- * trustedHosts 改用 ctx.get('webRuntime', true) 可选读取。
+ * trustedHosts 改用 ctx.get('webStartup' | 'webRuntime', true) 可选读取：
+ * 0.2.1-rc.3 删除了 webRuntime 服务、信任权威改为 webStartup.trustedHosts，
+ * 旧宿主仍用 webRuntime，故按新优先、旧回退读取。
  */
 export const inject = ['webServer', 'sessions', 'tools', 'connection'];
 
@@ -93,11 +101,34 @@ export function apply(ctx: DshContext): void {
   const service = new DbToolService(store);
 
   // HTTP API：挂在 DSH webServer 的 /dsh-db-tool/api 前缀下（同源访问）
+  /**
+   * rc.3 的 Connection 在 trustedHosts 之外还单独接受监听 bind 地址
+   * （isBindAddressAuthority）。本地兜底对齐该语义，但只补具体单播字面量：
+   * wildcard（0.0.0.0/::/*）与 loopback 一律跳过，不放宽 DNS rebinding 攻击面。
+   */
+  const bindAuthorities = (): string[] => {
+    const host = ctx.webServer?.host;
+    if (typeof host !== 'string') return [];
+    const h = host.trim();
+    if (h === '' || h === '*' || h === '0.0.0.0' || h === '::') return [];
+    if (isIP(h) === 0) return [];
+    if (h === '::1' || h === '::ffff:127.0.0.1' || /^127\./.test(h)) return [];
+    const port = ctx.webServer?.port;
+    if (typeof port !== 'number' || !(port > 0)) return [h];
+    return [h, `${h.includes(':') ? `[${h}]` : h}:${port}`];
+  };
+
   const trustedHosts = (): string[] => {
     try {
-      // webRuntime 不在 inject 内：缺失服务会让插件永不激活，故可选读取
-      const runtime = ctx.get?.('webRuntime', true) as { trustedHosts?: string[] } | undefined;
-      return runtime?.trustedHosts ?? [];
+      // webRuntime 不在 inject 内：缺失服务会让插件永不激活，故可选读取。
+      // 0.2.1-rc.3 删除了 webRuntime，改由 webStartup.trustedHosts 提供信任权威。
+      const startup = ctx.get?.('webStartup', true) as { trustedHosts?: string[] } | undefined;
+      const declared =
+        startup?.trustedHosts ??
+        (ctx.get?.('webRuntime', true) as { trustedHosts?: string[] } | undefined)?.trustedHosts ??
+        [];
+      // 仅 rc.3（webStartup 存在）补 bind 地址；旧宿主的 webRuntime 已含 bind 派生的 LAN 地址。
+      return startup === undefined ? declared : [...bindAuthorities(), ...declared];
     } catch {
       return [];
     }

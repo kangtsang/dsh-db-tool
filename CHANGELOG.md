@@ -1,5 +1,20 @@
 # Changelog — dsh-db-tool
 
+## 未发布
+
+修复 ro（只读）连接永久卡死与 Windows 路径大小写授权错位。
+
+### 修复
+
+- **mysql ro 模式连接永久卡死**：ro 适配器在 `pool.on('connection')` 钩子里执行 `SET SESSION TRANSACTION READ ONLY` 后，对返回的 mysql2 Query 命令对象挂 `.on('error')` 监听吞错——该监听会打断池接管前的命令处理序列，连接状态机卡死，**该连接后续一切查询永久 pending**。ro 适配器实例被服务层缓存，因此 ro 授权下列库/列表/表结构/预览全部挂起，`DatabaseManager` 工具同样卡死。现改为**回调式 query + 空回调**，不挂任何监听（真机四象限：非回调式挂、回调式+error 监听同样挂、唯回调式+空回调正常）。
+- **Windows 路径大小写授权错位**：`normalizeProjectKey` 此前仅把盘符小写、路径段保留原大小写；NTFS 大小写不敏感，`E:\GitHub\MyApp` 与 `e:\github\myapp` 是同一目录却被记成两条授权键，会话 cwd 写法与授权时不一致即 `UNAUTHORIZED_PROJECT`，数据浏览展开后无库无表。现在 win32 下全路径归一小写（POSIX 保持原样，`platform` 参数仅供测试注入）。
+- **grants.json 存量键迁移**：读入时把绝对路径形态的大小写变体键统一归一并合并（同连接 rw 胜出、grantedAt 取较新），下次 save 自然落盘为新键；`grant/revoke/check/grantsFor` 入口统一归一化，绕过 manager 的调用也不会写坏键。
+
+### 验证
+
+- `tests/store/normalize.spec.ts` 补大小写变体归一用例；`tests/store/grants.spec.ts` 补存量键迁移/合并用例。
+- `tests/adapters-sql/mysql.test.ts` 补 ro 模式回归（`DBT_TEST_MYSQL_URL` 门控）：ro 列库不得挂起 + query 白名单拦截写语句。
+
 ## 1.8.5
 
 DSH 0.2.1-rc.3 适配确认（宿主契约逐项对照，客户端与打包零改动）+ 非 loopback 部署信任来源修复 + hotfix 支持 0.2.1-rc.3。

@@ -98,4 +98,58 @@ describe('GrantStore', () => {
     store.grants.removeConn('nobody');
     expect(fs.existsSync(path.join(home, 'db-tool', 'grants.json'))).toBe(false);
   });
+
+  it('迁移：修复前保留大小写的键读入即归一，check 以归一写法命中（回归：Windows 大小写授权错位）', () => {
+    if (process.platform !== 'win32') return;
+    const file = path.join(home, 'db-tool', 'grants.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const legacy = 'E:/GitHub/MyApp'; // 修复前格式（仅盘符小写、路径段保留大小写）
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        grants: { [legacy]: [{ connId: 'conn-a', mode: 'ro', grantedAt: '2026-01-01T00:00:00.000Z' }] },
+      }),
+      'utf8',
+    );
+    store = new DbToolStore(home);
+    // 授权写法（旧格式）与会话 cwd 写法（任意大小写）都必须命中同一条授权
+    expect(store.grants.check(normalizeProjectKey(legacy), 'conn-a')).toBe('ro');
+    expect(store.grants.check(normalizeProjectKey('e:/GITHUB/myapp'), 'conn-a')).toBe('ro');
+    expect(store.grants.grantsFor(normalizeProjectKey(legacy))).toEqual([{ connId: 'conn-a', mode: 'ro' }]);
+    // grant 入口也归一：传原始大小写写法不会落出第二个键
+    store.grants.grant('E:\\GitHub\\MyApp', 'conn-b', 'ro');
+    const data = JSON.parse(fs.readFileSync(file, 'utf8')) as { grants: Record<string, unknown> };
+    expect(Object.keys(data.grants)).toEqual([normalizeProjectKey(legacy)]);
+  });
+
+  it('迁移：同一目录的大小写变体键合并为一条，同连接 rw 胜出且 grantedAt 取较新', () => {
+    if (process.platform !== 'win32') return;
+    const file = path.join(home, 'db-tool', 'grants.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        grants: {
+          'e:/GitHub/MyApp': [{ connId: 'conn-a', mode: 'ro', grantedAt: '2026-01-01T00:00:00.000Z' }],
+          'E:/github/MYAPP': [
+            { connId: 'conn-a', mode: 'rw', grantedAt: '2026-01-02T00:00:00.000Z' },
+            { connId: 'conn-b', mode: 'ro', grantedAt: '2026-01-02T00:00:00.000Z' },
+          ],
+        },
+      }),
+      'utf8',
+    );
+    store = new DbToolStore(home);
+    const key = normalizeProjectKey('e:/github/myapp');
+    expect(store.grants.check(key, 'conn-a')).toBe('rw'); // rw 胜出
+    expect(store.grants.check(key, 'conn-b')).toBe('ro');
+    expect(store.grants.grantsFor(key)).toEqual([
+      { connId: 'conn-a', mode: 'rw' },
+      { connId: 'conn-b', mode: 'ro' },
+    ]);
+    // 下次 save 落盘为单一归一键
+    store.grants.grant(key, 'conn-c', 'ro');
+    const after = JSON.parse(fs.readFileSync(file, 'utf8')) as { grants: Record<string, unknown> };
+    expect(Object.keys(after.grants)).toEqual([key]);
+  });
 });

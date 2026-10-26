@@ -28,23 +28,10 @@ import type { TxHandle } from '../sql-shared/pg-like.js';
 /** ro 模式下 query 允许的读语句首词白名单 */
 const RO_READ_PREFIX = /^(select|show|desc|describe|explain|use|help|table)\b/i;
 
-/**
- * 吞掉 'connection' 回调里会话级 SET 的失败（ro / time_zone 仅是增强，失败不应拖垮连接与进程）。
- * mysql2 promise 池的 'connection' 事件由核心池 emit、经 lib/promise/inherit_events.js
- * 原样转发参数，回调收到的是 callback 版 PoolConnection：其 query() 返回 Query 命令
- * 对象（EventEmitter，无 onResult 时错误走 emit('error')，lib/commands/command.js），
- * 无监听会抛 uncaughtException 崩溃进程——.catch 防御对它恒不生效，必须挂 error 监听。
- * 若驱动版本改为返回 Promise，则走 .catch 吞 rejection（双分支防御）。
- */
-function swallowSetError(r: unknown): void {
-  if (r && typeof (r as Promise<unknown>).catch === 'function') {
-    void (r as Promise<unknown>).catch(() => {});
-    return;
-  }
-  if (r && typeof (r as NodeJS.EventEmitter).on === 'function') {
-    (r as NodeJS.EventEmitter).on('error', () => {});
-  }
-}
+// 【历史教训，勿回退】'connection' 钩子里 SET 的失败处理只能走回调参数吞掉，
+// 不得给返回的 Query 命令挂 error 监听防 uncaughtException——
+// 该监听会打断池接管前的命令处理序列并使连接永久卡死
+// （真机复现：ro 模式列库/列表/预览全部永久 pending，见 attachReadOnly 注释）。
 
 function connOptions(conn: ResolvedConnection): mysql.PoolOptions {
   const base: mysql.PoolOptions = {
@@ -112,12 +99,17 @@ export async function createMysqlAdapter(
   };
 
   /** ro 模式：每个新底层连接自动设为只读会话（应用层另有 query 白名单双保险）。
-   *  回调收到的是 callback 版 PoolConnection，query() 返回 Query 命令对象（EventEmitter）：
-   *  吞掉 SET 失败防 uncaughtException（见 swallowSetError）。主池与跨库池共用同一注册。 */
+   *  SET 必须**回调式**执行且回调留空，绝不能对返回的 Query 命令挂 error 监听：
+   *  该监听会打断 mysql2 池接管前的命令处理序列，连接状态机卡死，后续一切查询永挂
+   *  （真机复现 3.24.4：非回调式、回调式+error 监听都会挂；唯「回调式+空回调」正常）。
+   *  主池与跨库池共用同一注册。 */
   const attachReadOnly = (p: mysql.Pool): void => {
     if (!readOnly) return;
     p.on('connection', (c) => {
-      swallowSetError(c.query('SET SESSION TRANSACTION READ ONLY') as unknown);
+      (c.query as unknown as (sql: string, cb: (err: unknown) => void) => void)(
+        'SET SESSION TRANSACTION READ ONLY',
+        () => {},
+      );
     });
   };
   attachReadOnly(pool);
